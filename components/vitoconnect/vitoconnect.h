@@ -78,11 +78,17 @@ class VitoConnect : public uart::UARTDevice, public PollingComponent {
     std::vector<Datapoint*> _datapoints;
     std::string protocol;
     struct CbArg {
-      CbArg(VitoConnect* vw, Datapoint* d) :
+      CbArg(VitoConnect* vw, Datapoint* d, bool write, uint32_t last_update, uint8_t* data = nullptr) :
         v(vw),
-        dp(d) {}
+        dp(d),
+        w(write),
+        la(last_update),
+        d(data) {}
       VitoConnect* v;
       Datapoint* dp;
+      bool w;
+      uint32_t la;
+      uint8_t* d;
     };
     static void _onData(uint8_t* data, uint8_t len, void* arg);
     static void _onError(uint8_t error, void* arg);
