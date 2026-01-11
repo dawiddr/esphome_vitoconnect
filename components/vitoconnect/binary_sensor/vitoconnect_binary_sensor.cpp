@@ -6,7 +6,7 @@ namespace vitoconnect {
 static const char *TAG = "vitoconnect.binary_sensor";
 
 OPTOLINKBinarySensor::OPTOLINKBinarySensor(){
-  // empty
+  // default bit mask already set in header initializer
 }
 
 OPTOLINKBinarySensor::~OPTOLINKBinarySensor() {
@@ -18,7 +18,9 @@ void OPTOLINKBinarySensor::decode(uint8_t* data, uint8_t length, Datapoint* dp) 
 
   if (!dp) dp = this;
 
-  publish_state(data[0]);
+  // Apply bit mask: publish true if any of the masked bits are set
+  bool active = (data[0] & _bit_mask_) != 0;
+  publish_state(active);
 }
 
 void OPTOLINKBinarySensor::encode(uint8_t* raw, uint8_t length, void* data) {
@@ -29,6 +31,10 @@ void OPTOLINKBinarySensor::encode(uint8_t* raw, uint8_t length, void* data) {
 void OPTOLINKBinarySensor::encode(uint8_t* raw, uint8_t length, float data) {
   assert(length >= _length);
 
+}
+
+void OPTOLINKBinarySensor::setBitMask(uint8_t mask) {
+  this->_bit_mask_ = mask;
 }
 
 }  // namespace vitoconnect
