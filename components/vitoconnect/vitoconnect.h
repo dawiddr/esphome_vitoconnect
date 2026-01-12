@@ -17,7 +17,7 @@
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-// Modified by Stefan Bickel, 2026-01-08: Updated `CbArg` struct to include an optional pointers for write operation verification.
+// Modified by Stefan Bickel, 2026-01-08: Updated `CbArg` struct to include an optional pointers for write verification.
 
 #pragma once
 
@@ -78,17 +78,15 @@ class VitoConnect : public uart::UARTDevice, public PollingComponent {
     std::vector<Datapoint*> _datapoints;
     std::string protocol;
     struct CbArg {
-      CbArg(VitoConnect* vw, Datapoint* d, bool write, uint32_t last_update, uint8_t* data = nullptr) :
+      CbArg(VitoConnect* vw, Datapoint* d, bool write = false, uint32_t last_update = 0) :
         v(vw),
         dp(d),
         w(write),
-        la(last_update),
-        d(data) {}
+        la(last_update) {}
       VitoConnect* v;
       Datapoint* dp;
       bool w;
       uint32_t la;
-      uint8_t* d;
     };
     static void _onData(uint8_t* data, uint8_t len, void* arg);
     static void _onError(uint8_t error, void* arg);
