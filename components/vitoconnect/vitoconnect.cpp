@@ -34,6 +34,7 @@ void VitoConnect::setup() {
     this->check_uart_settings(4800, 2, uart::UART_CONFIG_PARITY_EVEN, 8);
 
     ESP_LOGD(TAG, "Starting optolink with protocol: %s", this->protocol.c_str());
+    _optolink = nullptr;
     if (this->protocol.compare("P300") == 0) {
         _optolink = new OptolinkP300(this);
     } else if (this->protocol.compare("KW") == 0) {
@@ -67,10 +68,17 @@ void VitoConnect::register_datapoint(Datapoint *datapoint) {
 }
 
 void VitoConnect::loop() {
-    _optolink->loop();
+    if (_optolink) {
+      _optolink->loop();
+    }
 }
 
 void VitoConnect::update() {
+  if (!_optolink) {
+    ESP_LOGW(TAG, "Optolink not initialized; skipping update");
+    return;
+  }
+
   // This will be called every "update_interval" milliseconds.
   ESP_LOGD(TAG, "Schedule sensor update");
 

@@ -44,7 +44,11 @@ namespace vitoconnect {
 class VitoConnect : public uart::UARTDevice, public PollingComponent {
   public:
 
-    VitoConnect() : PollingComponent(0) {}
+    VitoConnect() : PollingComponent(0), _optolink(nullptr) {}
+    ~VitoConnect() override {
+      delete _optolink;
+      _optolink = nullptr;
+    }
 
     void setup() override;
     void loop() override;
