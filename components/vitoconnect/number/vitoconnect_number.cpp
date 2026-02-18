@@ -14,22 +14,34 @@ OPTOLINKNumber::OPTOLINKNumber(){}
 OPTOLINKNumber::~OPTOLINKNumber() {}
 
 void OPTOLINKNumber::control(float value) {
-  if (value < this->traits.get_min_value()) {
+  const float min_value = this->traits.get_min_value();
+  const float max_value = this->traits.get_max_value();
+
+  if (value < min_value) {
     ESP_LOGW(TAG, "control value of number %s below min_value", this->get_name().c_str());
-    value = this->traits.get_min_value();
+    value = min_value;
   }
-  if (value > this->traits.get_max_value()) {
+  if (value > max_value) {
     ESP_LOGW(TAG, "control value of number %s above max_value", this->get_name().c_str());
-    value = this->traits.get_max_value();
+    value = max_value;
   }
 
   float step = this->traits.get_step();
   if (step > 0.0f) {
-    float tmp = std::round(value / step) * step;
-    if( tmp != value) {
+    float tmp = min_value + std::round((value - min_value) / step) * step;
+    if (tmp != value) {
       ESP_LOGW(TAG, "control value of number %s not matching step %f", this->get_name().c_str(), step);
       value = tmp;
     }
+  }
+
+  if (value < min_value) {
+    ESP_LOGW(TAG, "control value of number %s below min_value after step quantization", this->get_name().c_str());
+    value = min_value;
+  }
+  if (value > max_value) {
+    ESP_LOGW(TAG, "control value of number %s above max_value after step quantization", this->get_name().c_str());
+    value = max_value;
   }
 
   ESP_LOGD(TAG, "state of number %s to value: %f", this->get_name().c_str(), value);
