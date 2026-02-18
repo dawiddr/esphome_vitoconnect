@@ -55,11 +55,17 @@ void Optolink::onError(OnErrorArgCallback callback) {
 }
 
 bool Optolink::read(uint16_t address, uint8_t length, void* arg) {
+  if (length == 0 || length > MAX_DP_LENGTH) {
+    return false;
+  }
   OptolinkDP dp(address, length, false, nullptr, arg);
   return _queue.push(dp);
 }
 
 bool Optolink::write(uint16_t address, uint8_t length, uint8_t* data, void* arg) {
+  if (length == 0 || length > MAX_DP_LENGTH || data == nullptr) {
+    return false;
+  }
   OptolinkDP dp(address, length, true, data, arg);
   return _queue.push(dp);
 }
