@@ -21,6 +21,9 @@
 
 #include "vitoconnect.h"
 
+#include <cstdio>
+#include <cstring>
+
 namespace esphome {
 namespace vitoconnect {
 
@@ -72,28 +75,60 @@ void VitoConnect::update() {
   ESP_LOGD(TAG, "Schedule sensor update");
 
   // prioritize writes over reads
-  bool foundDirty = false;
   for (Datapoint* dp : this->_datapoints) {
-    if(dp->getLastUpdate() != 0) {
-      foundDirty = true;
-      ESP_LOGD(TAG, "Datapoint with address %x was modified and needs to be written.", dp->getAddress());
+    if (dp->getLastUpdate() == 0) continue;
+    if (dp->isWriteInFlight()) {
+      ESP_LOGD(TAG, "Datapoint %x is dirty but a write is already in-flight; skipping enqueue", dp->getAddress());
+      continue;
+    }
 
-      const uint8_t dp_len = dp->getLength();
-      if (dp_len == 0 || dp_len > MAX_DP_LENGTH) {
-        ESP_LOGE(TAG, "Invalid datapoint length %u for address %x; skipping write", dp_len, dp->getAddress());
+    if (dp->getWriteFailCount() >= this->max_write_failures_) {
+      const uint32_t current_last_update = dp->getLastUpdate();
+      const uint32_t fail_seq = dp->getWriteFailSeq();
+      if (current_last_update != 0 && fail_seq == 0) {
+        ESP_LOGW(TAG, "Datapoint %x reached max_write_failures=%u with unknown failure seq; keeping pending seq=%u",
+                 dp->getAddress(), this->max_write_failures_, current_last_update);
+        dp->resetWriteFailCount();
+        dp->clearVerifyPending();
+      } else if (current_last_update != 0 && fail_seq != 0 && current_last_update != fail_seq) {
+        ESP_LOGW(TAG, "Datapoint %x reached max_write_failures=%u for stale seq=%u; keeping newer pending seq=%u",
+                 dp->getAddress(), this->max_write_failures_, fail_seq, current_last_update);
+        dp->resetWriteFailCount();
+        dp->clearVerifyPending();
+      } else {
+        ESP_LOGE(TAG, "Datapoint %x exceeded max_write_failures=%u for seq=%u; clearing dirty flag to stop retries",
+                 dp->getAddress(), this->max_write_failures_, fail_seq);
+        dp->clearLastUpdate();
+        dp->resetWriteFailCount();
+        dp->clearVerifyPending();
+        dp->setWriteInFlight(false);
         continue;
       }
-
-      uint8_t data[MAX_DP_LENGTH];
-      dp->encode(&data[0], dp_len);
-
-      // write the modified datapoint
-      CbArg* writeCbArg = new CbArg(this, dp, true, dp->getLastUpdate());
-      if (!_optolink->write(dp->getAddress(), dp_len, data, reinterpret_cast<void*>(writeCbArg))) {
-        delete writeCbArg;
-        return;
-      }
     }
+
+    ESP_LOGD(TAG, "Datapoint with address %x was modified and needs to be written.", dp->getAddress());
+
+    const uint8_t dp_len = dp->getLength();
+    if (dp_len == 0 || dp_len > MAX_DP_LENGTH) {
+      ESP_LOGE(TAG, "Invalid datapoint length %u for address %x; skipping write", dp_len, dp->getAddress());
+      continue;
+    }
+
+    uint8_t data[MAX_DP_LENGTH];
+    dp->encode(&data[0], dp_len);
+
+    // write the modified datapoint
+    CbArg* writeCbArg = new CbArg(this, dp, true, dp->getLastUpdate());
+    if (this->verify_writes_) {
+      writeCbArg->has_exp = true;
+      writeCbArg->exp_len = dp_len;
+      memcpy(writeCbArg->exp, data, dp_len);
+    }
+    if (!_optolink->write(dp->getAddress(), dp_len, data, reinterpret_cast<void*>(writeCbArg))) {
+      delete writeCbArg;
+      return;
+    }
+    dp->setWriteInFlight(true);
   }
 
   for (Datapoint* dp : this->_datapoints) {
@@ -110,6 +145,7 @@ void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
 
   if (cbArg->w) {
     ESP_LOGD(TAG, "Write operation for datapoint with address %x has been completed", cbArg->dp->getAddress());
+    cbArg->dp->setWriteInFlight(false);
     const uint32_t current_last_update = cbArg->dp->getLastUpdate();
     if (current_last_update == 0) {
       // already not dirty
@@ -117,16 +153,61 @@ void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
     } else if (current_last_update == cbArg->la) {
       // Only clear dirty flag if nothing changed since this write was queued.
       cbArg->dp->clearLastUpdate();
+      if (cbArg->v->verify_writes_ && cbArg->has_exp) {
+        cbArg->dp->setVerifyExpected(cbArg->la, cbArg->exp, cbArg->exp_len);
+      } else {
+        cbArg->dp->resetWriteFailCount();
+      }
     } else {
       // A newer change happened while this write was in flight. Keep dirty so it will be written again.
       ESP_LOGD(TAG, "Datapoint %x changed again during write (queued=%u, current=%u); keeping dirty", cbArg->dp->getAddress(), cbArg->la, current_last_update);
+      cbArg->dp->clearVerifyPending();
+      cbArg->dp->resetWriteFailCount();
     }
-  } else { // ignore onData responses for writes
-    if (cbArg->dp->getLastUpdate() > 0) {
-      ESP_LOGD(TAG, "Datapoint with address %x is being written, ignoring read responses until completion.", cbArg->dp->getAddress());
-    } else {
-      cbArg->dp->decode(data, len, cbArg->dp);
+  } else { // ignore read responses only while the datapoint write is in flight
+    if (cbArg->dp->isWriteInFlight()) {
+      ESP_LOGD(TAG, "Datapoint with address %x write is in-flight, ignoring read response.", cbArg->dp->getAddress());
+      delete cbArg;
+      return;
     }
+
+    if (cbArg->v->verify_writes_ && cbArg->dp->isVerifyPending()) {
+      const uint8_t vlen = cbArg->dp->getVerifyLength();
+      bool match = (vlen == len) && (memcmp(cbArg->dp->getVerifyExpected(), data, vlen) == 0);
+
+      if (!match) {
+        // log expected vs actual
+        char exp_hex[3 * MAX_DP_LENGTH + 1] = {0};
+        char act_hex[3 * MAX_DP_LENGTH + 1] = {0};
+        const uint8_t exp_dump_len = (vlen < MAX_DP_LENGTH) ? vlen : MAX_DP_LENGTH;
+        const uint8_t act_dump_len = (len < MAX_DP_LENGTH) ? len : MAX_DP_LENGTH;
+        for (uint8_t i = 0; i < exp_dump_len; i++) {
+          snprintf(&exp_hex[i * 3], 4, "%02X ", cbArg->dp->getVerifyExpected()[i]);
+        }
+        for (uint8_t i = 0; i < act_dump_len; i++) {
+          snprintf(&act_hex[i * 3], 4, "%02X ", data[i]);
+        }
+        ESP_LOGE(TAG, "Write verify mismatch for %x: expected[%u]=%s got[%u]=%s",
+                 cbArg->dp->getAddress(), vlen, exp_hex, len, act_hex);
+        // Re-mark dirty so update() can retry writing the desired value.
+        uint32_t retry_seq = cbArg->dp->getVerifySeq();
+        if (retry_seq == 0) {
+          retry_seq = millis();
+          if (retry_seq == 0) retry_seq = 1;
+        }
+        cbArg->dp->incWriteFailCount(retry_seq);
+        cbArg->dp->setLastUpdate(retry_seq);
+        cbArg->dp->clearVerifyPending();
+        delete cbArg;
+        return;
+      } else {
+        ESP_LOGD(TAG, "Write verify OK for %x", cbArg->dp->getAddress());
+        cbArg->dp->resetWriteFailCount();
+        cbArg->dp->clearVerifyPending();
+      }
+    }
+
+    cbArg->dp->decode(data, len, cbArg->dp);
   }
 
   delete cbArg;
@@ -135,6 +216,29 @@ void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
 void VitoConnect::_onError(uint8_t error, void* arg) {
   ESP_LOGD(TAG, "Error received: %d", error);
   CbArg* cbArg = reinterpret_cast<CbArg*>(arg);
+  if (cbArg->w) {
+    cbArg->dp->setWriteInFlight(false);
+    cbArg->dp->incWriteFailCount(cbArg->la);
+    cbArg->dp->clearVerifyPending();
+    const uint8_t fail_count = cbArg->dp->getWriteFailCount();
+    const uint32_t current_last_update = cbArg->dp->getLastUpdate();
+    if (fail_count >= cbArg->v->max_write_failures_) {
+      if (current_last_update == cbArg->la && current_last_update != 0) {
+        ESP_LOGE(TAG, "Write to %x failed %u times (max=%u). Clearing dirty flag to stop retries.",
+                 cbArg->dp->getAddress(), fail_count, cbArg->v->max_write_failures_);
+        cbArg->dp->clearLastUpdate();
+        cbArg->dp->resetWriteFailCount();
+      } else {
+        // Failure budget was exhausted for an older queued write. Keep a newer
+        // pending write dirty and give it a fresh retry budget.
+        if (current_last_update != 0) {
+          ESP_LOGW(TAG, "Write to %x reached max failures for stale seq %u (current=%u). Keeping newer pending write.",
+                   cbArg->dp->getAddress(), cbArg->la, current_last_update);
+        }
+        cbArg->dp->resetWriteFailCount();
+      }
+    }
+  }
   if (cbArg->v->_onErrorCb) cbArg->v->_onErrorCb(error, cbArg->dp);
   delete cbArg;
 }
