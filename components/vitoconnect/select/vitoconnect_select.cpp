@@ -1,6 +1,8 @@
 #include "vitoconnect_select.h"
 #include "esphome/core/log.h"
 
+#include <cstdlib>
+
 namespace esphome {
 namespace vitoconnect {
 
@@ -35,10 +37,33 @@ void OPTOLINKSelect::control(const std::string &value) {
     }
   }
 
-  // fallback: publish as-is if label not found
-  this->_last_update = millis();
-  ESP_LOGW(TAG, "Label %s not found in options", value.c_str());
-  publish_state(value);
+  // If the label is unknown, do NOT mark dirty blindly.
+  // Home Assistant normally only sends valid options, but automations may try to
+  // push arbitrary values. For safety, refuse unknown values.
+  char *end = nullptr;
+  long parsed = strtol(value.c_str(), &end, 10);
+  const bool is_int = (end != value.c_str()) && (*end == '\0');
+  if (is_int && parsed >= 0 && parsed <= 255) {
+    const uint8_t u = static_cast<uint8_t>(parsed);
+    for (size_t i = 0; i < this->option_values_.size(); ++i) {
+      if (this->option_values_[i] == u) {
+        this->current_value_ = u;
+        this->_last_update = millis();
+        // publish the mapped label if available, otherwise publish the numeric
+        // representation that was requested.
+        if (i < this->option_labels_.size()) {
+          publish_state(this->option_labels_[i]);
+        } else {
+          publish_state(value);
+        }
+        return;
+      }
+    }
+    ESP_LOGW(TAG, "Numeric option %ld not in allowed option_values; refusing to write", parsed);
+    return;
+  }
+
+  ESP_LOGW(TAG, "Label %s not found in options; refusing to write", value.c_str());
 }
 
 void OPTOLINKSelect::decode(uint8_t* data, uint8_t length, Datapoint* dp) {
@@ -54,7 +79,7 @@ void OPTOLINKSelect::decode(uint8_t* data, uint8_t length, Datapoint* dp) {
   }
 
   this->current_value_ = value;
-  
+
   // find matching label
   for (size_t i = 0; i < this->option_values_.size(); ++i) {
     if (this->option_values_[i] == value) {
@@ -62,7 +87,7 @@ void OPTOLINKSelect::decode(uint8_t* data, uint8_t length, Datapoint* dp) {
       return;
     }
   }
-  
+
   // not found: publish numeric string
   ESP_LOGW(TAG, "Value %d has no matching label", value);
   publish_state(std::to_string(value));
@@ -81,9 +106,9 @@ void OPTOLINKSelect::encode(uint8_t* raw, uint8_t length, void* data) {
 void OPTOLINKSelect::encode(uint8_t* raw, uint8_t length, uint8_t data) {
   assert(length >= _length);
   uint8_t value = data;
-  
+
   ESP_LOGD(TAG, "encode called with data: %d", value);
-  
+
   if( _length == 1) {
     raw[0] = value;
   } else {
