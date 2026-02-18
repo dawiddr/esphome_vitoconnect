@@ -288,18 +288,28 @@ void OptolinkP300::_receive() {
     return;
   }
 
-  if (_rcvBuffer[2] != 0x01) {
+  const uint8_t msgid = _rcvBuffer[2] & 0x0F;
+  const uint8_t fct = _rcvBuffer[3] & 0x1F;
+  const uint8_t payload_len = _rcvBuffer[6];
+  if (msgid == 0x03) {
+    if (payload_len > 0 && (static_cast<size_t>(payload_len) + 8U) <= _rcvLen) {
+      ESP_LOGW(TAG, "P300 error report 0x%02X for address %x", _rcvBuffer[7], dp->address);
+    } else {
+      ESP_LOGW(TAG, "P300 error report with invalid payload length %u", payload_len);
+    }
     _tryOnError(VITO_ERROR);
     _state = RECEIVE_ACK;
-  } else if (_rcvBuffer[3] == 0x01) {
-    const uint8_t payload_len = _rcvBuffer[6];
+  } else if (msgid != 0x01) {
+    _tryOnError(VITO_ERROR);
+    _state = RECEIVE_ACK;
+  } else if (fct == 0x01) {
     if (payload_len != dp->length || (static_cast<size_t>(payload_len) + 8U) != _rcvLen) {
       _tryOnError(LENGTH);
     } else {
       _tryOnData(&_rcvBuffer[7], payload_len);
     }
     _state = RECEIVE_ACK;
-  } else if (_rcvBuffer[3] == 0x02) {
+  } else if (fct == 0x02) {
     _tryOnData(dp->data, dp->length);
     _state = RECEIVE_ACK;
   } else {
