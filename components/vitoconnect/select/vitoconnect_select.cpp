@@ -83,7 +83,12 @@ void OPTOLINKSelect::decode(uint8_t* data, uint8_t length, Datapoint* dp) {
   // find matching label
   for (size_t i = 0; i < this->option_values_.size(); ++i) {
     if (this->option_values_[i] == value) {
-      publish_state(this->option_labels_[i]);
+      if (i < this->option_labels_.size()) {
+        publish_state(this->option_labels_[i]);
+      } else {
+        ESP_LOGW(TAG, "Value %d matched option_values index %u without label; publishing numeric value", value, (unsigned) i);
+        publish_state(std::to_string(value));
+      }
       return;
     }
   }
