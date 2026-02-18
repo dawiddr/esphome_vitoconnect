@@ -104,7 +104,17 @@ void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
 
   if (cbArg->w) {
     ESP_LOGD(TAG, "Write operation for datapoint with address %x has been completed", cbArg->dp->getAddress());
-    cbArg->dp->clearLastUpdate(); // clear dirty flag
+    const uint32_t current_last_update = cbArg->dp->getLastUpdate();
+    if (current_last_update == 0) {
+      // already not dirty
+      ESP_LOGD(TAG, "Datapoint %x already not marked dirty when write completed", cbArg->dp->getAddress());
+    } else if (current_last_update == cbArg->la) {
+      // Only clear dirty flag if nothing changed since this write was queued.
+      cbArg->dp->clearLastUpdate();
+    } else {
+      // A newer change happened while this write was in flight. Keep dirty so it will be written again.
+      ESP_LOGD(TAG, "Datapoint %x changed again during write (queued=%u, current=%u); keeping dirty", cbArg->dp->getAddress(), cbArg->la, current_last_update);
+    }
   } else { // ignore onData responses for writes
     if (cbArg->dp->getLastUpdate() > 0) {
       ESP_LOGD(TAG, "Datapoint with address %x is being written, ignoring read responses until completion.", cbArg->dp->getAddress());
