@@ -165,7 +165,14 @@ void OptolinkP300::_idle() {
 void OptolinkP300::_send() {
   uint8_t buff[MAX_DP_LENGTH + 8];
   drain_uart_(_uart);
+  _rcvBufferLen = 0;
+  _rcvLen = 0;
+  memset(_rcvBuffer, 0, sizeof(_rcvBuffer));
   OptolinkDP* dp = _queue.front();
+  if (dp == nullptr) {
+    _state = IDLE;
+    return;
+  }
   uint8_t length = dp->length;
   uint16_t address = dp->address;
   if (dp->write) {
@@ -181,8 +188,6 @@ void OptolinkP300::_send() {
     memcpy(&buff[7], dp->data, length);
     buff[7 + length] = calcChecksum(buff, 8 + length);
     _uart->write_array(buff, 8 + length);
-    _rcvLen = 8;  // Written payload is not returned, the return length is
-                  // always 8 bytes long
   } else {
     // type is READ
     // has fixed length of 8 chars
@@ -194,11 +199,8 @@ void OptolinkP300::_send() {
     buff[5] = address & 0xFF;
     buff[6] = length;
     buff[7] = calcChecksum(buff, 8);
-    _rcvLen = 8 + length;  // expected answer length is 8 + data length
     _uart->write_array(buff, 8);
   }
-  _rcvBufferLen = 0;
-  _rcvLen = 0;
   _lastMillis = millis();
   _state = SEND_ACK;
 }
@@ -219,49 +221,95 @@ void OptolinkP300::_sentAck() {
 }
 
 void OptolinkP300::_receive() {
-  while (_uart->available() != 0) {  // read complete RX buffer
-    _rcvBuffer[_rcvBufferLen] = _uart->read();
-    ++_rcvBufferLen;
+  while (_uart->available() != 0) {
+    int rb = _uart->read();
+    if (rb < 0) break;
+    const uint8_t b = static_cast<uint8_t>(rb);
+
+    if (_rcvBufferLen == 0) {
+      if (b != 0x41) continue;  // resync to start byte
+      _rcvBuffer[0] = b;
+      _rcvBufferLen = 1;
+      _rcvLen = 0;
+      _lastMillis = millis();
+      continue;
+    }
+
+    if (_rcvBufferLen >= sizeof(_rcvBuffer)) {
+      _tryOnError(LENGTH);
+      _rcvBufferLen = 0;
+      _rcvLen = 0;
+      memset(_rcvBuffer, 0, sizeof(_rcvBuffer));
+      _state = RESET;
+      return;
+    }
+
+    _rcvBuffer[_rcvBufferLen++] = b;
     _lastMillis = millis();
+
+    if (_rcvBufferLen == 2) {
+      const size_t total = static_cast<size_t>(_rcvBuffer[1]) + 3U;
+      if (total < 8U || total > sizeof(_rcvBuffer)) {
+        _rcvBufferLen = 0;
+        _rcvLen = 0;
+        memset(_rcvBuffer, 0, sizeof(_rcvBuffer));
+        if (b == 0x41) {
+          _rcvBuffer[0] = b;
+          _rcvBufferLen = 1;
+        }
+        continue;
+      }
+      _rcvLen = total;
+    }
+
+    if (_rcvLen != 0 && _rcvBufferLen >= _rcvLen) {
+      break;
+    }
   }
-  if (_rcvBuffer[0] != 0x41) {
-    // wait for start byte
+
+  if (_rcvLen == 0 || _rcvBufferLen < _rcvLen) return;
+
+  if (!checkChecksum(_rcvBuffer, static_cast<uint8_t>(_rcvLen))) {
+    const uint8_t nack[] = {0x15};
+    _uart->write_array(nack, sizeof(nack));
+    _rcvBufferLen = 0;
+    _rcvLen = 0;
+    memset(_rcvBuffer, 0, sizeof(_rcvBuffer));
+    _lastMillis = millis();
     return;
   }
-  // ESP_LOGD(TAG, "buffer fill: %02x", _rcvBuffer[_rcvBufferLen-1]);
-  // ESP_LOGD(TAG, "buffer fill: %d", _rcvBufferLen);
-  // ESP_LOGD(TAG, "buffer fill: %d", _rcvLen);
-  if (_rcvBufferLen == _rcvLen) {     // message complete, check message
-    if (_rcvBuffer[1] != (_rcvLen - 3)) {  // check for message length
+
+  OptolinkDP* dp = _queue.front();
+  if (dp == nullptr) {
+    _rcvBufferLen = 0;
+    _rcvLen = 0;
+    memset(_rcvBuffer, 0, sizeof(_rcvBuffer));
+    _state = IDLE;
+    return;
+  }
+
+  if (_rcvBuffer[2] != 0x01) {
+    _tryOnError(VITO_ERROR);
+    _state = RECEIVE_ACK;
+  } else if (_rcvBuffer[3] == 0x01) {
+    const uint8_t payload_len = _rcvBuffer[6];
+    if (payload_len != dp->length || (static_cast<size_t>(payload_len) + 8U) != _rcvLen) {
       _tryOnError(LENGTH);
-      _state = RECEIVE_ACK;
-      return;
-    }
-    if (_rcvBuffer[2] != 0x01) {  // Vitotronic returns an error message
-      _tryOnError(VITO_ERROR);
-      _state = RECEIVE_ACK;
-      return;
-    }
-    if (!checkChecksum(_rcvBuffer, _rcvLen)) {  // checksum is wrong
-      _tryOnError(CRC);
-      _state = RECEIVE_ACK;  // TODO(@bertmelis): should we return NACK?
-      return;
-    }
-    OptolinkDP* dp = _queue.front();
-    if (_rcvBuffer[3] == 0x01) {
-      // message is from READ command, so returning read value
-      _tryOnData(&_rcvBuffer[7], dp->length);
-    } else if (_rcvBuffer[3] == 0x02) {
-      // message is from WRITE command, so returning written value
-      _tryOnData(dp->data, dp->length);
     } else {
-      // should not be here
+      _tryOnData(&_rcvBuffer[7], payload_len);
     }
     _state = RECEIVE_ACK;
-    return;
+  } else if (_rcvBuffer[3] == 0x02) {
+    _tryOnData(dp->data, dp->length);
+    _state = RECEIVE_ACK;
   } else {
-    // not yet complete
+    _tryOnError(VITO_ERROR);
+    _state = RECEIVE_ACK;
   }
+
+  _rcvBufferLen = 0;
+  _rcvLen = 0;
+  memset(_rcvBuffer, 0, sizeof(_rcvBuffer));
 }
 
 void OptolinkP300::_receiveAck() {
