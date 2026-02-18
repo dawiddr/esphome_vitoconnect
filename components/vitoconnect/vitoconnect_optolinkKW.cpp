@@ -146,13 +146,30 @@ void OptolinkKW::_send() {
 }
 
 void OptolinkKW::_receive() {
-  while (_uart->available() != 0) {  // read complete RX buffer
-    _rcvBuffer[_rcvBufferLen] = _uart->read();
-    ++_rcvBufferLen;
+  while (_uart->available() != 0) {
+    int rb = _uart->read();
+    if (rb < 0) break;
+    if (_rcvBufferLen >= sizeof(_rcvBuffer)) {
+      _tryOnError(LENGTH);
+      _rcvBufferLen = 0;
+      memset(_rcvBuffer, 0, sizeof(_rcvBuffer));
+      _state = INIT;
+      _uart->flush();
+      _lastMillis = millis();
+      return;
+    }
+    _rcvBuffer[_rcvBufferLen++] = static_cast<uint8_t>(rb);
     _lastMillis = millis();
+    if (_rcvBufferLen >= _rcvLen) break;
   }
-  if (_rcvBufferLen == _rcvLen) {  // message complete, TODO: check message (eg 0x00 for READ messages)   
+  if (_rcvBufferLen == _rcvLen) {
     OptolinkDP* dp = _queue.front();
+    if (dp != nullptr && dp->write && _rcvBufferLen == 1 && _rcvBuffer[0] != 0x00) {
+      _tryOnError(VITO_ERROR);
+      _state = IDLE;
+      _lastMillis = millis();
+      return;
+    }
     ESP_LOGD(TAG, "Adding data to datapoint with address %x and received length %d", dp->address, _rcvBufferLen);
     _tryOnData(_rcvBuffer, _rcvBufferLen);
     _state = IDLE;
@@ -161,7 +178,7 @@ void OptolinkKW::_receive() {
   } else if (millis() - _lastMillis > 1 * 1000UL) {  // Vitotronic isn't answering, try again
     ESP_LOGD(TAG, "Received length %d doesn't match expected length %d", _rcvBufferLen, _rcvLen);
     _rcvBufferLen = 0;
-    memset(_rcvBuffer, 0, 4);
+    memset(_rcvBuffer, 0, sizeof(_rcvBuffer));
     _state = INIT;
   }
 }
