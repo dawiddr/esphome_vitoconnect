@@ -78,12 +78,18 @@ void VitoConnect::update() {
       foundDirty = true;
       ESP_LOGD(TAG, "Datapoint with address %x was modified and needs to be written.", dp->getAddress());
 
-      uint8_t data[dp->getLength()];
-      dp->encode(&data[0], dp->getLength());
+      const uint8_t dp_len = dp->getLength();
+      if (dp_len == 0 || dp_len > MAX_DP_LENGTH) {
+        ESP_LOGE(TAG, "Invalid datapoint length %u for address %x; skipping write", dp_len, dp->getAddress());
+        continue;
+      }
+
+      uint8_t data[MAX_DP_LENGTH];
+      dp->encode(&data[0], dp_len);
 
       // write the modified datapoint
       CbArg* writeCbArg = new CbArg(this, dp, true, dp->getLastUpdate());
-      if (!_optolink->write(dp->getAddress(), dp->getLength(), data, reinterpret_cast<void*>(writeCbArg))) {
+      if (!_optolink->write(dp->getAddress(), dp_len, data, reinterpret_cast<void*>(writeCbArg))) {
         delete writeCbArg;
         return;
       }

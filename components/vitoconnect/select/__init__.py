@@ -19,7 +19,7 @@ OPTOLINKSelect = vitoconnect_ns.class_("OPTOLINKSelect", select.Select)
 #   - value: 2
 #     label: "Heating and DHW"
 OPTIONS_SCHEMA = cv.Schema({
-    cv.Required("value"): cv.int_,
+    cv.Required("value"): cv.uint8_t,
     cv.Required("label"): cv.string,
 })
 
@@ -27,7 +27,7 @@ CONFIG_SCHEMA = select.select_schema(OPTOLINKSelect).extend({
     cv.GenerateID(): cv.declare_id(OPTOLINKSelect),
     cv.GenerateID(CONF_VITOCONNECT_ID): cv.use_id(VitoConnect),
     cv.Required(CONF_ADDRESS): cv.uint16_t,
-    cv.Required(CONF_LENGTH): cv.uint8_t,
+    cv.Optional(CONF_LENGTH, default=1): cv.one_of(1, int=True),
     cv.Required(CONF_OPTIONS): cv.ensure_list(OPTIONS_SCHEMA),
 })
 
