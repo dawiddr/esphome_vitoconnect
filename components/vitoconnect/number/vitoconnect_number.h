@@ -20,9 +20,11 @@ class OPTOLINKNumber : public number::Number, public Datapoint {
     void encode(uint8_t* raw, uint8_t length, float data);
     void encode(uint8_t* raw, uint8_t length) override;
 
-    void setDivRatio(size_t div) { this->_div_ratio = div; }
+    void setDivRatio(float div) { this->_div_ratio = div; }
+    void setSigned(bool is_signed) { this->_signed = is_signed; }
   private:
-    size_t _div_ratio = 1;
+    float _div_ratio = 1.0f;
+    bool _signed = false;
 };
 
 }  // namespace vitoconnect
