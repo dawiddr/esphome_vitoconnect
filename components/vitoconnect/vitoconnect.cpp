@@ -132,6 +132,18 @@ void VitoConnect::update() {
   }
 
   for (Datapoint* dp : this->_datapoints) {
+      // Never poll-read a datapoint while a local value is pending to be written.
+      // Otherwise the stale controller value can overwrite the requested state
+      // before retries happen.
+      if (dp->isWriteInFlight()) {
+          ESP_LOGD(TAG, "Skipping read for %x: write is in-flight", dp->getAddress());
+          continue;
+      }
+      if (dp->getLastUpdate() != 0) {
+          ESP_LOGD(TAG, "Skipping read for %x: pending local write seq=%u", dp->getAddress(), dp->getLastUpdate());
+          continue;
+      }
+
       CbArg* arg = new CbArg(this, dp);
       if (_optolink->read(dp->getAddress(), dp->getLength(), reinterpret_cast<void*>(arg))) {
       } else {
@@ -167,6 +179,12 @@ void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
   } else { // ignore read responses only while the datapoint write is in flight
     if (cbArg->dp->isWriteInFlight()) {
       ESP_LOGD(TAG, "Datapoint with address %x write is in-flight, ignoring read response.", cbArg->dp->getAddress());
+      delete cbArg;
+      return;
+    }
+    if (cbArg->dp->getLastUpdate() != 0) {
+      ESP_LOGD(TAG, "Datapoint with address %x has pending local write seq=%u, ignoring read response.",
+               cbArg->dp->getAddress(), cbArg->dp->getLastUpdate());
       delete cbArg;
       return;
     }
