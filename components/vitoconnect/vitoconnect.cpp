@@ -152,8 +152,14 @@ void VitoConnect::update() {
           continue;
       }
 
+      const uint8_t dp_len = dp->getLength();
+      if (dp_len == 0 || dp_len > MAX_DP_LENGTH) {
+          ESP_LOGE(TAG, "Invalid datapoint length %u for address %x; skipping read", dp_len, dp->getAddress());
+          continue;
+      }
+
       CbArg* arg = new CbArg(this, dp);
-      if (_optolink->read(dp->getAddress(), dp->getLength(), reinterpret_cast<void*>(arg))) {
+      if (_optolink->read(dp->getAddress(), dp_len, reinterpret_cast<void*>(arg))) {
       } else {
           delete arg;
       }
