@@ -30,6 +30,12 @@ namespace vitoconnect {
 
 static const char *TAG = "vitoconnect";
 
+static inline void drain_uart_(uart::UARTDevice *uart) {
+  while (uart != nullptr && uart->available()) {
+    (void) uart->read();
+  }
+}
+
 inline uint8_t calcChecksum(uint8_t array[], uint8_t length) {
   uint8_t sum = 0;
   for (uint8_t i = 1; i < length - 1; ++i) {  // start with second byte and end before checksum
@@ -56,6 +62,7 @@ void OptolinkP300::begin() {
 }
 
 void OptolinkP300::loop() {
+  const uint32_t now = millis();
   switch (_state) {
   case RESET:
     _reset();
@@ -88,10 +95,13 @@ void OptolinkP300::loop() {
     // begin() not called
     break;
   }
-  if (_queue.size() > 0 && millis() - _lastMillis > 5000UL) {  // if no ACK is coming, reset connection
+  const bool request_in_flight = (_queue.size() > 0) && (_state == SEND_ACK || _state == RECEIVE);
+  if (request_in_flight && (now - _lastMillis > 5000UL)) {
     _tryOnError(TIMEOUT);
     _state = RESET;
+    drain_uart_(_uart);
     _uart->flush();
+    _lastMillis = now;
   }
   // TODO(@bertmelis): move timeouts here, clear queue on timeout
 }
@@ -105,14 +115,20 @@ void OptolinkP300::_reset() {
 }
 
 void OptolinkP300::_resetAck() {
-  if (_uart->read() == 0x05) {
-    // received 0x05/enquiry: optolink has been reset
-    _lastMillis = millis();
-    _state = INIT;
-  } else {
-    if (millis() - _lastMillis > 1000) {  // try again every 0,5sec
-      _state = RESET;
+  if (_uart->available()) {
+    int rb = _uart->read();
+    if (rb >= 0) {
+      uint8_t b = static_cast<uint8_t>(rb);
+      if (b == 0x05 || b == 0x06) {
+        // received reset acknowledgment
+        _lastMillis = millis();
+        _state = INIT;
+        return;
+      }
     }
+  }
+  if (millis() - _lastMillis > 500UL) {
+    _state = RESET;
   }
 }
 
@@ -131,6 +147,9 @@ void OptolinkP300::_initAck() {
       _state = IDLE;
     }
   }
+  if (millis() - _lastMillis > 1000UL) {
+    _state = RESET;
+  }
 }
 
 void OptolinkP300::_idle() {
@@ -145,6 +164,7 @@ void OptolinkP300::_idle() {
 
 void OptolinkP300::_send() {
   uint8_t buff[MAX_DP_LENGTH + 8];
+  drain_uart_(_uart);
   OptolinkDP* dp = _queue.front();
   uint8_t length = dp->length;
   uint16_t address = dp->address;
@@ -178,6 +198,7 @@ void OptolinkP300::_send() {
     _uart->write_array(buff, 8);
   }
   _rcvBufferLen = 0;
+  _rcvLen = 0;
   _lastMillis = millis();
   _state = SEND_ACK;
 }
