@@ -119,8 +119,8 @@ class Datapoint {
   uint32_t _verify_seq = 0;
   uint8_t _verify_length = 0;
   uint8_t _verify_expected[kMaxDpLength] = {0};
-  uint16_t _address;
-  uint8_t _length;
+  uint16_t _address{0};
+  uint8_t _length{0};
   static std::function<void(uint8_t[], uint8_t, Datapoint* dp)> _stdOnData;
 };
 
