@@ -71,12 +71,16 @@ bool Optolink::write(uint16_t address, uint8_t length, uint8_t* data, void* arg)
 }
 
 void Optolink::_tryOnData(uint8_t* data, uint8_t len) {
-  if (_onData) _onData(data, len, _queue.front()->arg);
+  OptolinkDP* dp = _queue.front();
+  if (dp == nullptr) return;
+  if (_onData) _onData(data, len, dp->arg);
   _queue.pop();
 }
 
 void Optolink::_tryOnError(uint8_t error) {
-  if (_onError) _onError(error, _queue.front()->arg);
+  OptolinkDP* dp = _queue.front();
+  if (dp == nullptr) return;
+  if (_onError) _onError(error, dp->arg);
   _queue.pop();
 }
 
