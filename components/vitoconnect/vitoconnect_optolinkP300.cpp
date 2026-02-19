@@ -311,14 +311,26 @@ void OptolinkP300::_receive() {
     _tryOnError(VITO_ERROR);
     _state = RECEIVE_ACK;
   } else if (fct == 0x01) {
-    if (payload_len != dp->length || (static_cast<size_t>(payload_len) + 8U) != _rcvLen) {
+    if (dp->write) {
+      ESP_LOGW(TAG, "P300 got READ response but front of queue is WRITE (addr=%04X)", dp->address);
+      _tryOnError(VITO_ERROR);
+    } else if (payload_len != dp->length || (static_cast<size_t>(payload_len) + 8U) != _rcvLen) {
       _tryOnError(LENGTH);
     } else {
       _tryOnData(&_rcvBuffer[7], payload_len);
     }
     _state = RECEIVE_ACK;
   } else if (fct == 0x02) {
-    _tryOnData(dp->data, dp->length);
+    if (!dp->write) {
+      ESP_LOGW(TAG, "P300 got WRITE response but front of queue is READ (addr=%04X)", dp->address);
+      _tryOnError(VITO_ERROR);
+    } else if ((payload_len != dp->length) || (_rcvLen != 8U)) {
+      ESP_LOGW(TAG, "P300 write response length mismatch: resp_len=%u expected=%u frame=%u",
+               payload_len, dp->length, (unsigned) _rcvLen);
+      _tryOnError(LENGTH);
+    } else {
+      _tryOnData(dp->data, dp->length);
+    }
     _state = RECEIVE_ACK;
   } else {
     _tryOnError(VITO_ERROR);
