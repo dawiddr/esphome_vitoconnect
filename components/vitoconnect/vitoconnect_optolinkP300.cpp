@@ -207,13 +207,25 @@ void OptolinkP300::_send() {
 
 void OptolinkP300::_sentAck() {
   if (_uart->available()) {
-    uint8_t buff = _uart->read();
+    int rb = _uart->read();
+    if (rb < 0) return;
+    uint8_t buff = static_cast<uint8_t>(rb);
     if (buff == 0x06) {  // transmit successful, moving to next state
+      _lastMillis = millis();
+      _state = RECEIVE;
+      return;
+    } else if (buff == 0x41) {
+      memset(_rcvBuffer, 0, sizeof(_rcvBuffer));
+      _rcvBuffer[0] = 0x41;
+      _rcvBufferLen = 1;
+      _rcvLen = 0;
+      _lastMillis = millis();
       _state = RECEIVE;
       return;
     } else if (buff == 0x15) {  // transmit negatively acknowledged, return
                                 // to IDLE
       _tryOnError(NACK);
+      _lastMillis = millis();
       _state = IDLE;
       return;
     }
