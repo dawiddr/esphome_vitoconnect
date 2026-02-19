@@ -24,6 +24,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
 #include "vitoconnect_optolinkP300.h"
+#include <cstddef>
 
 namespace esphome {
 namespace vitoconnect {
@@ -36,15 +37,15 @@ static inline void drain_uart_(uart::UARTDevice *uart) {
   }
 }
 
-inline uint8_t calcChecksum(uint8_t array[], uint8_t length) {
+inline uint8_t calcChecksum(const uint8_t* array, size_t length) {
   uint8_t sum = 0;
-  for (uint8_t i = 1; i < length - 1; ++i) {  // start with second byte and end before checksum
+  for (size_t i = 1; i < length - 1; ++i) {  // start with second byte and end before checksum
     sum += array[i];
   }
   return sum;
 }
 
-inline bool checkChecksum(uint8_t array[], uint8_t length) {
+inline bool checkChecksum(const uint8_t* array, size_t length) {
   return (array[length - 1] == calcChecksum(array, length));
 }
 
@@ -281,7 +282,7 @@ void OptolinkP300::_receive() {
 
   if (_rcvLen == 0 || _rcvBufferLen < _rcvLen) return;
 
-  if (!checkChecksum(_rcvBuffer, static_cast<uint8_t>(_rcvLen))) {
+  if (!checkChecksum(_rcvBuffer, _rcvLen)) {
     const uint8_t nack[] = {0x15};
     _uart->write_array(nack, sizeof(nack));
     _rcvBufferLen = 0;
