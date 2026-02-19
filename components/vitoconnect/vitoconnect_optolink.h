@@ -195,6 +195,8 @@ class Optolink {
   SimpleQueue<OptolinkDP> _queue;  // TODO(bertmelis): add semaphore to ESP32 version to guard access to queue
   OnDataArgCallback _onData;
   OnErrorArgCallback _onError;
+  void (*_onDataNoArg)(uint8_t* data, uint8_t len);
+  void (*_onErrorNoArg)(uint8_t error);
 };
 
 }  // namespace vitoconnect
