@@ -88,6 +88,12 @@ void OPTOLINKNumber::decode(uint8_t* data, uint8_t length, Datapoint* dp) {
       iv = (int64_t) u;
     }
   } else {
+    const uint64_t max_i64 = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    if (_length == 8 && u > max_i64) {
+      ESP_LOGW(TAG, "decode %s: unsigned 64-bit raw=%llu above INT64_MAX; clamping",
+               this->get_name().c_str(), (unsigned long long) u);
+      u = max_i64;
+    }
     iv = (int64_t) u;
   }
 
