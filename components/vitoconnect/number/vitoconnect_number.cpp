@@ -52,6 +52,11 @@ void OPTOLINKNumber::control(float value) {
 }
 
 void OPTOLINKNumber::decode(uint8_t* data, uint8_t length, Datapoint* dp) {
+  if (_length == 0 || _length > 8) {
+    ESP_LOGE(TAG, "Unsupported number length %u for %s (must be 1..8)",
+             (unsigned) _length, this->get_name().c_str());
+    return;
+  }
   if (length < _length) {
     ESP_LOGW(TAG, "decode length mismatch for %s: got=%u expected=%u",
              this->get_name().c_str(), (unsigned) length, (unsigned) _length);
@@ -102,6 +107,11 @@ void OPTOLINKNumber::encode(uint8_t* raw, uint8_t length, void* data) {
 }
 
 void OPTOLINKNumber::encode(uint8_t* raw, uint8_t length, float data) {
+  if (_length == 0 || _length > 8) {
+    ESP_LOGE(TAG, "Unsupported number length %u for %s (must be 1..8)",
+             (unsigned) _length, this->get_name().c_str());
+    return;
+  }
   if (length < _length) {
     ESP_LOGW(TAG, "encode length mismatch for %s: got=%u expected=%u",
              this->get_name().c_str(), (unsigned) length, (unsigned) _length);
@@ -139,7 +149,7 @@ void OPTOLINKNumber::encode(uint8_t* raw, uint8_t length, float data) {
   } else {
     min_v = 0;
     const uint64_t max_u = (bits == 64) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << bits) - 1ULL);
-    max_v = (int64_t) max_u;
+    max_v = (bits == 64) ? std::numeric_limits<int64_t>::max() : (int64_t) max_u;
     mask = max_u;
   }
 
