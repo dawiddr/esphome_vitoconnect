@@ -30,7 +30,10 @@ void OPTOLINKSensor::decode(uint8_t* data, uint8_t length, Datapoint* dp) {
   }  
   else if (_length == 4){   // Commonly counter with different factors
     uint32_t tmp = 0;
-    tmp = data[3] << 24 | data[2] << 16 | data[1] << 8 | data[0];
+    tmp = (static_cast<uint32_t>(data[3]) << 24) |
+          (static_cast<uint32_t>(data[2]) << 16) |
+          (static_cast<uint32_t>(data[1]) << 8) |
+          (static_cast<uint32_t>(data[0]) << 0);
     float value = tmp / 1.0f;
     publish_state(value);
   }
