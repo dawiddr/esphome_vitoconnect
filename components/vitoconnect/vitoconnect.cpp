@@ -122,7 +122,7 @@ void VitoConnect::update() {
       continue;
     }
 
-    uint8_t data[MAX_DP_LENGTH];
+    uint8_t data[MAX_DP_LENGTH] = {0};
     dp->encode(&data[0], dp_len);
 
     // write the modified datapoint
