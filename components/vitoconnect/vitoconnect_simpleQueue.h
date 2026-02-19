@@ -77,6 +77,9 @@ class SimpleQueue {
       _nextPosition = _count;
       if (_nextPosition == _size) _nextPosition = 0;
     }
+  SimpleQueue& operator=(const SimpleQueue&) = delete;
+  SimpleQueue(SimpleQueue&&) = delete;
+  SimpleQueue& operator=(SimpleQueue&&) = delete;
 
   /**
    * @brief Destroy the SimpleQueue object.
