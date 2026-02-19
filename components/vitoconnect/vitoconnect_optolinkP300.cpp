@@ -291,7 +291,15 @@ void OptolinkP300::_receive() {
   const uint8_t msgid = _rcvBuffer[2] & 0x0F;
   const uint8_t fct = _rcvBuffer[3] & 0x1F;
   const uint8_t payload_len = _rcvBuffer[6];
-  if (msgid == 0x03) {
+  const uint16_t resp_addr =
+      (static_cast<uint16_t>(_rcvBuffer[4]) << 8) |
+      static_cast<uint16_t>(_rcvBuffer[5]);
+  if (resp_addr != dp->address) {
+    ESP_LOGW(TAG, "P300 response address mismatch: expected %04X got %04X",
+             dp->address, resp_addr);
+    _tryOnError(VITO_ERROR);
+    _state = RECEIVE_ACK;
+  } else if (msgid == 0x03) {
     if (payload_len > 0 && (static_cast<size_t>(payload_len) + 8U) <= _rcvLen) {
       ESP_LOGW(TAG, "P300 error report 0x%02X for address %x", _rcvBuffer[7], dp->address);
     } else {
