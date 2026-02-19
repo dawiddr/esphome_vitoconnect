@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 
 namespace esphome {
@@ -126,9 +127,15 @@ void OPTOLINKNumber::encode(uint8_t* raw, uint8_t length, float data) {
   uint64_t mask = 0;
 
   if (this->_signed) {
-    min_v = -(1LL << (bits - 1));
-    max_v =  (1LL << (bits - 1)) - 1;
-    mask = (bits == 64) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << bits) - 1ULL);
+    if (bits == 64) {
+      min_v = std::numeric_limits<int64_t>::min();
+      max_v = std::numeric_limits<int64_t>::max();
+      mask = 0xFFFFFFFFFFFFFFFFULL;
+    } else {
+      min_v = -(1LL << (bits - 1));
+      max_v =  (1LL << (bits - 1)) - 1;
+      mask = (1ULL << bits) - 1ULL;
+    }
   } else {
     min_v = 0;
     const uint64_t max_u = (bits == 64) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << bits) - 1ULL);
