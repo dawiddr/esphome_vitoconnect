@@ -51,7 +51,11 @@ void OPTOLINKNumber::control(float value) {
 }
 
 void OPTOLINKNumber::decode(uint8_t* data, uint8_t length, Datapoint* dp) {
-  assert(length >= _length);
+  if (length < _length) {
+    ESP_LOGW(TAG, "decode length mismatch for %s: got=%u expected=%u",
+             this->get_name().c_str(), (unsigned) length, (unsigned) _length);
+    return;
+  }
 
   if (this->_div_ratio <= 0.0f) {
     ESP_LOGW(TAG, "Invalid div_ratio (%f) for number %s; forcing to 1.0", (double) this->_div_ratio, this->get_name().c_str());
@@ -97,7 +101,11 @@ void OPTOLINKNumber::encode(uint8_t* raw, uint8_t length, void* data) {
 }
 
 void OPTOLINKNumber::encode(uint8_t* raw, uint8_t length, float data) {
-  assert(length >= _length);
+  if (length < _length) {
+    ESP_LOGW(TAG, "encode length mismatch for %s: got=%u expected=%u",
+             this->get_name().c_str(), (unsigned) length, (unsigned) _length);
+    return;
+  }
 
   if (this->_div_ratio <= 0.0f) {
     ESP_LOGW(TAG, "Invalid div_ratio (%f) for number %s; forcing to 1.0", (double) this->_div_ratio, this->get_name().c_str());

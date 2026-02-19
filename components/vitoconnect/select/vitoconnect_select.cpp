@@ -67,7 +67,11 @@ void OPTOLINKSelect::control(const std::string &value) {
 }
 
 void OPTOLINKSelect::decode(uint8_t* data, uint8_t length, Datapoint* dp) {
-  assert(length >= _length);
+  if (length < _length) {
+    ESP_LOGW(TAG, "decode length mismatch for %s: got=%u expected=%u",
+             this->get_name().c_str(), (unsigned) length, (unsigned) _length);
+    return;
+  }
 
   uint8_t value = 0;
 
@@ -109,7 +113,11 @@ void OPTOLINKSelect::encode(uint8_t* raw, uint8_t length, void* data) {
 }
 
 void OPTOLINKSelect::encode(uint8_t* raw, uint8_t length, uint8_t data) {
-  assert(length >= _length);
+  if (length < _length) {
+    ESP_LOGW(TAG, "encode length mismatch for %s: got=%u expected=%u",
+             this->get_name().c_str(), (unsigned) length, (unsigned) _length);
+    return;
+  }
   uint8_t value = data;
 
   ESP_LOGD(TAG, "encode called with data: %d", value);
