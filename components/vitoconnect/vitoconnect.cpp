@@ -167,6 +167,10 @@ void VitoConnect::update() {
 }
 
 void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
+  if (arg == nullptr) {
+    ESP_LOGW(TAG, "Optolink onData callback invoked with null arg");
+    return;
+  }
   CbArg* cbArg = reinterpret_cast<CbArg*>(arg);
 
   if (cbArg->w) {
@@ -247,6 +251,10 @@ void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
 
 void VitoConnect::_onError(uint8_t error, void* arg) {
   ESP_LOGD(TAG, "Error received: %d", error);
+  if (arg == nullptr) {
+    ESP_LOGW(TAG, "Optolink onError callback invoked with null arg");
+    return;
+  }
   CbArg* cbArg = reinterpret_cast<CbArg*>(arg);
   if (cbArg->w) {
     cbArg->dp->setWriteInFlight(false);
