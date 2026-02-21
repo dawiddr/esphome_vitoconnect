@@ -45,7 +45,7 @@ class VitoConnect : public uart::UARTDevice, public PollingComponent {
   public:
 
     VitoConnect() : PollingComponent(0), _optolink(nullptr) {}
-    ~VitoConnect() override {
+    ~VitoConnect() {
       delete _optolink;
       _optolink = nullptr;
     }
