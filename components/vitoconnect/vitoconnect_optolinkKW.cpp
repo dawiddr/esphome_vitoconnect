@@ -75,32 +75,29 @@ void OptolinkKW::loop() {
 
 void OptolinkKW::_init() {
   const uint32_t now = millis();
-  if (_isHandshakeBackoffActive(now)) {
-    return;
-  }
-
-  if (_uart->available()) {
+  // Drain a bounded number of bytes while scanning for READY to avoid RX buildup on noisy lines.
+  for (uint8_t i = 0; i < 16 && _uart->available(); ++i) {
     if (_uart->peek() == 0x05) {
       _markHandshakeSuccess();
       _state = IDLE;
       _idle();
-    } else {
-      _uart->read();
-      if (now - _lastMillis > 1000UL) {
-        _markHandshakeFailure(TAG, now);
-        _lastMillis = now;
-        _uart->flush();
-        const uint8_t buff[] = {0x04};
-        _uart->write_array(buff, sizeof(buff));
-      }
+      return;
     }
-  } else {
-    if (now - _lastMillis > 1000UL) {  // try to reset if Vitotronic is in a connected state with the P300 protocol
-      _markHandshakeFailure(TAG, now);
-      _lastMillis = now;
-      const uint8_t buff[] = {0x04};
-      _uart->write_array(buff, sizeof(buff));
+    (void) _uart->read();
+  }
+
+  if (_isHandshakeBackoffActive(now)) {
+    return;
+  }
+
+  if (now - _lastMillis > 1000UL) {  // try to reset if Vitotronic is in a connected state with the P300 protocol
+    _markHandshakeFailure(TAG, now);
+    _lastMillis = now;
+    while (_uart->available()) {
+      (void) _uart->read();
     }
+    const uint8_t buff[] = {0x04};
+    _uart->write_array(buff, sizeof(buff));
   }
 }
 
