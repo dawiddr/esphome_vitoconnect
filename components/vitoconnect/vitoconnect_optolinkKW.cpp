@@ -40,6 +40,7 @@ OptolinkKW::OptolinkKW(uart::UARTDevice* uart) :
   _rcvLen(0) {}
 
 void OptolinkKW::begin() {
+  _markHandshakeSuccess();
   _state = INIT;
 }
 
@@ -73,16 +74,30 @@ void OptolinkKW::loop() {
 }
 
 void OptolinkKW::_init() {
+  const uint32_t now = millis();
+  if (_isHandshakeBackoffActive(now)) {
+    return;
+  }
+
   if (_uart->available()) {
     if (_uart->peek() == 0x05) {
+      _markHandshakeSuccess();
       _state = IDLE;
       _idle();
     } else {
       _uart->read();
+      if (now - _lastMillis > 1000UL) {
+        _markHandshakeFailure(TAG, now);
+        _lastMillis = now;
+        _uart->flush();
+        const uint8_t buff[] = {0x04};
+        _uart->write_array(buff, sizeof(buff));
+      }
     }
   } else {
-    if (millis() - _lastMillis > 1000UL) {  // try to reset if Vitotronic is in a connected state with the P300 protocol
-      _lastMillis = millis();
+    if (now - _lastMillis > 1000UL) {  // try to reset if Vitotronic is in a connected state with the P300 protocol
+      _markHandshakeFailure(TAG, now);
+      _lastMillis = now;
       const uint8_t buff[] = {0x04};
       _uart->write_array(buff, sizeof(buff));
     }

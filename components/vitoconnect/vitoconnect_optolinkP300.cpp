@@ -59,6 +59,8 @@ OptolinkP300::OptolinkP300(uart::UARTDevice* uart) :
   _rcvLen(0) {}
 
 void OptolinkP300::begin() {
+  _markHandshakeSuccess();
+  _lastMillis = millis();
   _state = RESET;
 }
 
@@ -108,6 +110,9 @@ void OptolinkP300::loop() {
 }
 
 void OptolinkP300::_reset() {
+  if (_isHandshakeBackoffActive(millis())) {
+    return;
+  }
   // Set communication with Vitotronic to defined state = reset to KW protocol
   const uint8_t buff[] = {0x04};
   _uart->write_array(buff, sizeof(buff));
@@ -128,7 +133,9 @@ void OptolinkP300::_resetAck() {
       }
     }
   }
-  if (millis() - _lastMillis > 500UL) {
+  const uint32_t now = millis();
+  if (now - _lastMillis > 500UL) {
+    _markHandshakeFailure(TAG, now);
     _state = RESET;
   }
 }
@@ -145,10 +152,13 @@ void OptolinkP300::_initAck() {
     if (_uart->read() == 0x06) {
       // ACK received, moving to next state
       _lastMillis = millis();
+      _markHandshakeSuccess();
       _state = IDLE;
     }
   }
-  if (millis() - _lastMillis > 1000UL) {
+  const uint32_t now = millis();
+  if (now - _lastMillis > 1000UL) {
+    _markHandshakeFailure(TAG, now);
     _state = RESET;
   }
 }
