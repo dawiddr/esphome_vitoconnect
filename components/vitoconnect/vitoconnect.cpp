@@ -52,7 +52,7 @@ void VitoConnect::setup() {
 
     this->check_uart_settings(4800, 2, uart::UART_CONFIG_PARITY_EVEN, 8);
 
-    ESP_LOGD(TAG, "Starting optolink with protocol: %s", this->protocol.c_str());
+    ESP_LOGI(TAG, "Starting optolink with protocol: %s", this->protocol.c_str());
     _optolink = nullptr;
     if (this->protocol.compare("P300") == 0) {
         _optolink = new OptolinkP300(this);
@@ -133,7 +133,7 @@ void VitoConnect::update() {
       }
     }
 
-    ESP_LOGD(TAG, "Datapoint with address %x was modified and needs to be written.", dp->getAddress());
+    ESP_LOGI(TAG, "Datapoint 0x%04X marked dirty; scheduling write", dp->getAddress());
 
     const uint8_t dp_len = dp->getLength();
     if (dp_len == 0 || dp_len > MAX_DP_LENGTH) {
@@ -151,10 +151,17 @@ void VitoConnect::update() {
       writeCbArg->exp_len = dp_len;
       memcpy(writeCbArg->exp, data, dp_len);
     }
+    ESP_LOGD(TAG, "Queue write addr=0x%04X len=%u seq=%u verify=%s",
+             dp->getAddress(),
+             static_cast<unsigned>(dp_len),
+             static_cast<unsigned>(dp->getLastUpdate()),
+             this->verify_writes_ ? "on" : "off");
     if (!_optolink->write(dp->getAddress(), dp_len, data, reinterpret_cast<void*>(writeCbArg))) {
+      ESP_LOGW(TAG, "Failed to queue write addr=0x%04X len=%u", dp->getAddress(), static_cast<unsigned>(dp_len));
       delete writeCbArg;
       return;
     }
+    ESP_LOGD(TAG, "Queued write addr=0x%04X len=%u", dp->getAddress(), static_cast<unsigned>(dp_len));
     dp->setWriteInFlight(true);
   }
 
@@ -178,8 +185,11 @@ void VitoConnect::update() {
       }
 
       CbArg* arg = new CbArg(this, dp);
+      ESP_LOGD(TAG, "Queue read addr=0x%04X len=%u", dp->getAddress(), static_cast<unsigned>(dp_len));
       if (_optolink->read(dp->getAddress(), dp_len, reinterpret_cast<void*>(arg))) {
+          ESP_LOGD(TAG, "Queued read addr=0x%04X len=%u", dp->getAddress(), static_cast<unsigned>(dp_len));
       } else {
+          ESP_LOGW(TAG, "Failed to queue read addr=0x%04X len=%u", dp->getAddress(), static_cast<unsigned>(dp_len));
           delete arg;
       }
   }
@@ -193,7 +203,11 @@ void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
   CbArg* cbArg = reinterpret_cast<CbArg*>(arg);
 
   if (cbArg->w) {
-    ESP_LOGD(TAG, "Write operation for datapoint with address %x has been completed", cbArg->dp->getAddress());
+    ESP_LOGI(TAG, "Write completed addr=0x%04X len=%u seq=%u",
+             cbArg->dp->getAddress(),
+             static_cast<unsigned>(len),
+             static_cast<unsigned>(cbArg->la));
+    ESP_LOGD(TAG, "Write response payload addr=0x%04X len=%u", cbArg->dp->getAddress(), static_cast<unsigned>(len));
     cbArg->dp->setWriteInFlight(false);
     const uint32_t current_last_update = cbArg->dp->getLastUpdate();
     if (current_last_update == 0) {
@@ -262,6 +276,7 @@ void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
       }
     }
 
+    ESP_LOGD(TAG, "Read response addr=0x%04X len=%u", cbArg->dp->getAddress(), static_cast<unsigned>(len));
     cbArg->dp->decode(data, len, cbArg->dp);
   }
 

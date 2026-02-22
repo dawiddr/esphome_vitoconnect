@@ -108,6 +108,11 @@ void OptolinkP300::loop() {
   }
   const bool request_in_flight = (_queue.size() > 0) && (_state == SEND_ACK || _state == RECEIVE);
   if (request_in_flight && (now - _lastMillis > 5000UL)) {
+    OptolinkDP *dp = _queue.front();
+    ESP_LOGW(TAG, "TIMEOUT in state=%u addr=0x%04X len=%u",
+             static_cast<unsigned>(_state),
+             dp != nullptr ? dp->address : 0U,
+             dp != nullptr ? static_cast<unsigned>(dp->length) : 0U);
     _tryOnError(TIMEOUT);
     _state = RESET;
     drain_uart_(_uart);
