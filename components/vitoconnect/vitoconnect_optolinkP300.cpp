@@ -30,6 +30,8 @@ namespace esphome {
 namespace vitoconnect {
 
 static const char *TAG = "vitoconnect";
+static constexpr uint32_t P300_RESET_ACK_TIMEOUT_MS = 1000UL;
+static constexpr uint32_t P300_INIT_ACK_TIMEOUT_MS = 5000UL;
 
 static inline void drain_uart_(uart::UARTDevice *uart) {
   while (uart != nullptr && uart->available()) {
@@ -56,7 +58,9 @@ OptolinkP300::OptolinkP300(uart::UARTDevice* uart) :
   _write(false),
   _rcvBuffer{0},
   _rcvBufferLen(0),
-  _rcvLen(0) {}
+  _rcvLen(0),
+  _initAckSawRx(false),
+  _initAckLastRx(0) {}
 
 void OptolinkP300::begin() {
   _markHandshakeSuccess();
@@ -114,6 +118,7 @@ void OptolinkP300::_reset() {
     return;
   }
   // Set communication with Vitotronic to defined state = reset to KW protocol
+  drain_uart_(_uart);
   const uint8_t buff[] = {0x04};
   _uart->write_array(buff, sizeof(buff));
   _lastMillis = millis();
@@ -121,26 +126,32 @@ void OptolinkP300::_reset() {
 }
 
 void OptolinkP300::_resetAck() {
-  if (_uart->available()) {
+  while (_uart->available()) {
     int rb = _uart->read();
-    if (rb >= 0) {
-      uint8_t b = static_cast<uint8_t>(rb);
-      if (b == 0x05 || b == 0x06) {
-        // received reset acknowledgment
-        _lastMillis = millis();
-        _state = INIT;
-        return;
-      }
+    if (rb < 0) {
+      break;
+    }
+    uint8_t b = static_cast<uint8_t>(rb);
+    if (b == 0x05 || b == 0x06) {
+      // received reset acknowledgment
+      _lastMillis = millis();
+      _state = INIT;
+      return;
     }
   }
   const uint32_t now = millis();
-  if (now - _lastMillis > 500UL) {
+  if (now - _lastMillis > P300_RESET_ACK_TIMEOUT_MS) {
+    ESP_LOGW(TAG, "P300 reset ACK timeout after %lu ms",
+             static_cast<unsigned long>(P300_RESET_ACK_TIMEOUT_MS));
     _markHandshakeFailure(TAG, now);
     _state = RESET;
   }
 }
 
 void OptolinkP300::_init() {
+  drain_uart_(_uart);
+  _initAckSawRx = false;
+  _initAckLastRx = 0;
   const uint8_t buff[] = {0x16, 0x00, 0x00};
   _uart->write_array(buff, sizeof(buff));
   _lastMillis = millis();
@@ -148,16 +159,31 @@ void OptolinkP300::_init() {
 }
 
 void OptolinkP300::_initAck() {
-  if (_uart->available()) {
-    if (_uart->read() == 0x06) {
+  while (_uart->available()) {
+    int rb = _uart->read();
+    if (rb < 0) {
+      break;
+    }
+    const uint8_t b = static_cast<uint8_t>(rb);
+    _initAckSawRx = true;
+    _initAckLastRx = b;
+    if (b == 0x06) {
       // ACK received, moving to next state
       _lastMillis = millis();
       _markHandshakeSuccess();
       _state = IDLE;
+      return;
     }
   }
   const uint32_t now = millis();
-  if (now - _lastMillis > 1000UL) {
+  if (now - _lastMillis > P300_INIT_ACK_TIMEOUT_MS) {
+    if (_initAckSawRx) {
+      ESP_LOGW(TAG, "P300 enable ACK timeout after %lu ms, last RX byte=0x%02X",
+               static_cast<unsigned long>(P300_INIT_ACK_TIMEOUT_MS), _initAckLastRx);
+    } else {
+      ESP_LOGW(TAG, "P300 enable ACK timeout after %lu ms, no RX bytes",
+               static_cast<unsigned long>(P300_INIT_ACK_TIMEOUT_MS));
+    }
     _markHandshakeFailure(TAG, now);
     _state = RESET;
   }
