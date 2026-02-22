@@ -371,13 +371,13 @@ void OptolinkP300::_receive() {
       (static_cast<uint16_t>(_rcvBuffer[4]) << 8) |
       static_cast<uint16_t>(_rcvBuffer[5]);
   if (resp_addr != dp->address) {
-    ESP_LOGW(TAG, "P300 response address mismatch: expected %04X got %04X",
+    ESP_LOGW(TAG, "P300 response address mismatch: expected addr=0x%04X got addr=0x%04X",
              dp->address, resp_addr);
     _tryOnError(VITO_ERROR);
     _state = RECEIVE_ACK;
   } else if (msgid == 0x03) {
     if (payload_len > 0 && (static_cast<size_t>(payload_len) + 8U) <= _rcvLen) {
-      ESP_LOGW(TAG, "P300 error report 0x%02X for address %x", _rcvBuffer[7], dp->address);
+      ESP_LOGW(TAG, "P300 error report=0x%02X for addr=0x%04X", _rcvBuffer[7], dp->address);
     } else {
       ESP_LOGW(TAG, "P300 error report with invalid payload length %u", payload_len);
     }
@@ -388,7 +388,7 @@ void OptolinkP300::_receive() {
     _state = RECEIVE_ACK;
   } else if (fct == 0x01) {
     if (dp->write) {
-      ESP_LOGW(TAG, "P300 got READ response but front of queue is WRITE (addr=%04X)", dp->address);
+      ESP_LOGW(TAG, "P300 received READ response for WRITE request: addr=0x%04X", dp->address);
       _tryOnError(VITO_ERROR);
     } else if (payload_len != dp->length || (static_cast<size_t>(payload_len) + 8U) != _rcvLen) {
       _tryOnError(LENGTH);
@@ -398,11 +398,11 @@ void OptolinkP300::_receive() {
     _state = RECEIVE_ACK;
   } else if (fct == 0x02) {
     if (!dp->write) {
-      ESP_LOGW(TAG, "P300 got WRITE response but front of queue is READ (addr=%04X)", dp->address);
+      ESP_LOGW(TAG, "P300 received WRITE response for READ request: addr=0x%04X", dp->address);
       _tryOnError(VITO_ERROR);
     } else if ((payload_len != dp->length) || (_rcvLen != 8U)) {
-      ESP_LOGW(TAG, "P300 write response length mismatch: resp_len=%u expected=%u frame=%u",
-               payload_len, dp->length, (unsigned) _rcvLen);
+      ESP_LOGW(TAG, "P300 write response length mismatch: addr=0x%04X resp_len=%u expected=%u frame=%u",
+               dp->address, payload_len, dp->length, static_cast<unsigned>(_rcvLen));
       _tryOnError(LENGTH);
     } else {
       _tryOnData(dp->data, dp->length);

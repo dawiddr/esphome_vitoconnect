@@ -82,7 +82,8 @@ void VitoConnect::setup() {
 }
 
 void VitoConnect::register_datapoint(Datapoint *datapoint) {
-    ESP_LOGD(TAG, "Adding datapoint with address %x and length %d", datapoint->getAddress(), datapoint->getLength());
+    ESP_LOGD(TAG, "Register datapoint addr=0x%04X len=%u",
+             datapoint->getAddress(), static_cast<unsigned>(datapoint->getLength()));
     this->_datapoints.push_back(datapoint);
 }
 
@@ -98,14 +99,16 @@ void VitoConnect::update() {
     return;
   }
 
-  // This will be called every "update_interval" milliseconds.
-  ESP_LOGD(TAG, "Schedule sensor update");
+  uint32_t queued_writes = 0;
+  uint32_t queued_reads = 0;
+  ESP_LOGI(TAG, "Starting poll cycle: datapoints=%u",
+           static_cast<unsigned>(this->_datapoints.size()));
 
   // prioritize writes over reads
   for (Datapoint* dp : this->_datapoints) {
     if (dp->getLastUpdate() == 0) continue;
     if (dp->isWriteInFlight()) {
-      ESP_LOGD(TAG, "Datapoint %x is dirty but a write is already in-flight; skipping enqueue", dp->getAddress());
+      ESP_LOGD(TAG, "Skip write enqueue: addr=0x%04X write already in-flight", dp->getAddress());
       continue;
     }
 
@@ -113,17 +116,17 @@ void VitoConnect::update() {
       const uint32_t current_last_update = dp->getLastUpdate();
       const uint32_t fail_seq = dp->getWriteFailSeq();
       if (current_last_update != 0 && fail_seq == 0) {
-        ESP_LOGW(TAG, "Datapoint %x reached max_write_failures=%u with unknown failure seq; keeping pending seq=%u",
+        ESP_LOGW(TAG, "Write retry budget reached for addr=0x%04X (max=%u, failure_seq=unknown); keeping pending seq=%u",
                  dp->getAddress(), this->max_write_failures_, current_last_update);
         dp->resetWriteFailCount();
         dp->clearVerifyPending();
       } else if (current_last_update != 0 && fail_seq != 0 && current_last_update != fail_seq) {
-        ESP_LOGW(TAG, "Datapoint %x reached max_write_failures=%u for stale seq=%u; keeping newer pending seq=%u",
+        ESP_LOGW(TAG, "Write retry budget reached for addr=0x%04X (max=%u, stale seq=%u); keeping newer pending seq=%u",
                  dp->getAddress(), this->max_write_failures_, fail_seq, current_last_update);
         dp->resetWriteFailCount();
         dp->clearVerifyPending();
       } else {
-        ESP_LOGE(TAG, "Datapoint %x exceeded max_write_failures=%u for seq=%u; clearing dirty flag to stop retries",
+        ESP_LOGE(TAG, "Write failed too often for addr=0x%04X (max=%u, seq=%u); clearing dirty flag",
                  dp->getAddress(), this->max_write_failures_, fail_seq);
         dp->clearLastUpdate();
         dp->resetWriteFailCount();
@@ -137,7 +140,8 @@ void VitoConnect::update() {
 
     const uint8_t dp_len = dp->getLength();
     if (dp_len == 0 || dp_len > MAX_DP_LENGTH) {
-      ESP_LOGE(TAG, "Invalid datapoint length %u for address %x; skipping write", dp_len, dp->getAddress());
+      ESP_LOGE(TAG, "Invalid write datapoint definition: addr=0x%04X len=%u",
+               dp->getAddress(), static_cast<unsigned>(dp_len));
       continue;
     }
 
@@ -162,6 +166,7 @@ void VitoConnect::update() {
       return;
     }
     ESP_LOGD(TAG, "Queued write addr=0x%04X len=%u", dp->getAddress(), static_cast<unsigned>(dp_len));
+    ++queued_writes;
     dp->setWriteInFlight(true);
   }
 
@@ -170,17 +175,19 @@ void VitoConnect::update() {
       // Otherwise the stale controller value can overwrite the requested state
       // before retries happen.
       if (dp->isWriteInFlight()) {
-          ESP_LOGD(TAG, "Skipping read for %x: write is in-flight", dp->getAddress());
+          ESP_LOGD(TAG, "Skip read enqueue: addr=0x%04X write in-flight", dp->getAddress());
           continue;
       }
       if (dp->getLastUpdate() != 0) {
-          ESP_LOGD(TAG, "Skipping read for %x: pending local write seq=%u", dp->getAddress(), dp->getLastUpdate());
+          ESP_LOGD(TAG, "Skip read enqueue: addr=0x%04X pending write seq=%u",
+                   dp->getAddress(), dp->getLastUpdate());
           continue;
       }
 
       const uint8_t dp_len = dp->getLength();
       if (dp_len == 0 || dp_len > MAX_DP_LENGTH) {
-          ESP_LOGE(TAG, "Invalid datapoint length %u for address %x; skipping read", dp_len, dp->getAddress());
+          ESP_LOGE(TAG, "Invalid read datapoint definition: addr=0x%04X len=%u",
+                   dp->getAddress(), static_cast<unsigned>(dp_len));
           continue;
       }
 
@@ -188,11 +195,14 @@ void VitoConnect::update() {
       ESP_LOGD(TAG, "Queue read addr=0x%04X len=%u", dp->getAddress(), static_cast<unsigned>(dp_len));
       if (_optolink->read(dp->getAddress(), dp_len, reinterpret_cast<void*>(arg))) {
           ESP_LOGD(TAG, "Queued read addr=0x%04X len=%u", dp->getAddress(), static_cast<unsigned>(dp_len));
+          ++queued_reads;
       } else {
           ESP_LOGW(TAG, "Failed to queue read addr=0x%04X len=%u", dp->getAddress(), static_cast<unsigned>(dp_len));
           delete arg;
       }
   }
+  ESP_LOGI(TAG, "Completed poll cycle: queued writes=%u queued reads=%u",
+           static_cast<unsigned>(queued_writes), static_cast<unsigned>(queued_reads));
 }
 
 void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
@@ -212,7 +222,7 @@ void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
     const uint32_t current_last_update = cbArg->dp->getLastUpdate();
     if (current_last_update == 0) {
       // already not dirty
-      ESP_LOGD(TAG, "Datapoint %x already not marked dirty when write completed", cbArg->dp->getAddress());
+      ESP_LOGD(TAG, "Write completion for addr=0x%04X found no dirty flag", cbArg->dp->getAddress());
     } else if (current_last_update == cbArg->la) {
       // Only clear dirty flag if nothing changed since this write was queued.
       cbArg->dp->clearLastUpdate();
@@ -223,18 +233,19 @@ void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
       }
     } else {
       // A newer change happened while this write was in flight. Keep dirty so it will be written again.
-      ESP_LOGD(TAG, "Datapoint %x changed again during write (queued=%u, current=%u); keeping dirty", cbArg->dp->getAddress(), cbArg->la, current_last_update);
+      ESP_LOGD(TAG, "Datapoint changed during write: addr=0x%04X queued seq=%u current seq=%u; keeping dirty",
+               cbArg->dp->getAddress(), cbArg->la, current_last_update);
       cbArg->dp->clearVerifyPending();
       cbArg->dp->resetWriteFailCount();
     }
   } else { // ignore read responses only while the datapoint write is in flight
     if (cbArg->dp->isWriteInFlight()) {
-      ESP_LOGD(TAG, "Datapoint with address %x write is in-flight, ignoring read response.", cbArg->dp->getAddress());
+      ESP_LOGD(TAG, "Ignoring read response: addr=0x%04X write in-flight", cbArg->dp->getAddress());
       delete cbArg;
       return;
     }
     if (cbArg->dp->getLastUpdate() != 0) {
-      ESP_LOGD(TAG, "Datapoint with address %x has pending local write seq=%u, ignoring read response.",
+      ESP_LOGD(TAG, "Ignoring read response: addr=0x%04X pending write seq=%u",
                cbArg->dp->getAddress(), cbArg->dp->getLastUpdate());
       delete cbArg;
       return;
@@ -256,7 +267,7 @@ void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
         for (uint8_t i = 0; i < act_dump_len; i++) {
           snprintf(&act_hex[i * 3], 4, "%02X ", data[i]);
         }
-        ESP_LOGE(TAG, "Write verify mismatch for %x: expected[%u]=%s got[%u]=%s",
+        ESP_LOGE(TAG, "Write verify mismatch: addr=0x%04X expected[%u]=%s got[%u]=%s",
                  cbArg->dp->getAddress(), vlen, exp_hex, len, act_hex);
         // Re-mark dirty so update() can retry writing the desired value.
         uint32_t retry_seq = cbArg->dp->getVerifySeq();
@@ -270,7 +281,7 @@ void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
         delete cbArg;
         return;
       } else {
-        ESP_LOGD(TAG, "Write verify OK for %x", cbArg->dp->getAddress());
+        ESP_LOGD(TAG, "Write verify OK: addr=0x%04X", cbArg->dp->getAddress());
         cbArg->dp->resetWriteFailCount();
         cbArg->dp->clearVerifyPending();
       }
@@ -292,11 +303,19 @@ void VitoConnect::_onError(uint8_t error, void* arg) {
   }
   CbArg* cbArg = reinterpret_cast<CbArg*>(arg);
   if (cbArg->dp != nullptr) {
-    ESP_LOGW(TAG, "Optolink error %u (%s) during %s addr=0x%04X len=%u",
-             static_cast<unsigned>(error), error_name,
-             cbArg->w ? "write" : "read",
-             cbArg->dp->getAddress(),
-             static_cast<unsigned>(cbArg->dp->getLength()));
+    if (error == TIMEOUT) {
+      ESP_LOGD(TAG, "Optolink error %u (%s) during %s addr=0x%04X len=%u",
+               static_cast<unsigned>(error), error_name,
+               cbArg->w ? "write" : "read",
+               cbArg->dp->getAddress(),
+               static_cast<unsigned>(cbArg->dp->getLength()));
+    } else {
+      ESP_LOGW(TAG, "Optolink error %u (%s) during %s addr=0x%04X len=%u",
+               static_cast<unsigned>(error), error_name,
+               cbArg->w ? "write" : "read",
+               cbArg->dp->getAddress(),
+               static_cast<unsigned>(cbArg->dp->getLength()));
+    }
   } else {
     ESP_LOGW(TAG, "Optolink error %u (%s) during %s with null datapoint",
              static_cast<unsigned>(error), error_name, cbArg->w ? "write" : "read");
@@ -313,7 +332,7 @@ void VitoConnect::_onError(uint8_t error, void* arg) {
     const uint32_t current_last_update = cbArg->dp->getLastUpdate();
     if (fail_count >= cbArg->v->max_write_failures_) {
       if (current_last_update == cbArg->la && current_last_update != 0) {
-        ESP_LOGE(TAG, "Write to %x failed %u times (max=%u). Clearing dirty flag to stop retries.",
+        ESP_LOGE(TAG, "Write failed repeatedly: addr=0x%04X failures=%u max=%u; clearing dirty flag",
                  cbArg->dp->getAddress(), fail_count, cbArg->v->max_write_failures_);
         cbArg->dp->clearLastUpdate();
         cbArg->dp->resetWriteFailCount();
@@ -321,7 +340,7 @@ void VitoConnect::_onError(uint8_t error, void* arg) {
         // Failure budget was exhausted for an older queued write. Keep a newer
         // pending write dirty and give it a fresh retry budget.
         if (current_last_update != 0) {
-          ESP_LOGW(TAG, "Write to %x reached max failures for stale seq %u (current=%u). Keeping newer pending write.",
+          ESP_LOGW(TAG, "Write reached max failures for stale seq: addr=0x%04X stale=%u current=%u; keeping newer pending write",
                    cbArg->dp->getAddress(), cbArg->la, current_last_update);
         }
         cbArg->dp->resetWriteFailCount();
