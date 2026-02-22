@@ -29,6 +29,25 @@ namespace vitoconnect {
 
 static const char *TAG = "vitoconnect";
 
+namespace {
+const char *optolink_error_name_(uint8_t error) {
+  switch (error) {
+    case TIMEOUT:
+      return "TIMEOUT";
+    case LENGTH:
+      return "LENGTH";
+    case NACK:
+      return "NACK";
+    case CRC:
+      return "CRC";
+    case VITO_ERROR:
+      return "VITO_ERROR";
+    default:
+      return "UNKNOWN";
+  }
+}
+}  // namespace
+
 void VitoConnect::setup() {
 
     this->check_uart_settings(4800, 2, uart::UART_CONFIG_PARITY_EVEN, 8);
@@ -250,12 +269,27 @@ void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
 }
 
 void VitoConnect::_onError(uint8_t error, void* arg) {
-  ESP_LOGD(TAG, "Error received: %d", error);
+  const char *error_name = optolink_error_name_(error);
   if (arg == nullptr) {
-    ESP_LOGW(TAG, "Optolink onError callback invoked with null arg");
+    ESP_LOGW(TAG, "Optolink error %u (%s) with null arg",
+             static_cast<unsigned>(error), error_name);
     return;
   }
   CbArg* cbArg = reinterpret_cast<CbArg*>(arg);
+  if (cbArg->dp != nullptr) {
+    ESP_LOGW(TAG, "Optolink error %u (%s) during %s addr=0x%04X len=%u",
+             static_cast<unsigned>(error), error_name,
+             cbArg->w ? "write" : "read",
+             cbArg->dp->getAddress(),
+             static_cast<unsigned>(cbArg->dp->getLength()));
+  } else {
+    ESP_LOGW(TAG, "Optolink error %u (%s) during %s with null datapoint",
+             static_cast<unsigned>(error), error_name, cbArg->w ? "write" : "read");
+    if (cbArg->v->_onErrorCb) cbArg->v->_onErrorCb(error, nullptr);
+    delete cbArg;
+    return;
+  }
+
   if (cbArg->w) {
     cbArg->dp->setWriteInFlight(false);
     cbArg->dp->incWriteFailCount(cbArg->la);
