@@ -30,8 +30,10 @@ namespace esphome {
 namespace vitoconnect {
 
 static const char *TAG = "vitoconnect";
-static constexpr uint32_t P300_RESET_ACK_TIMEOUT_MS = 1000UL;
+static constexpr uint32_t P300_RESET_ACK_TIMEOUT_MS = 5000UL;
 static constexpr uint32_t P300_INIT_ACK_TIMEOUT_MS = 5000UL;
+static constexpr uint32_t P300_ENABLE_RETRY_MIN_MS = 100UL;
+static constexpr uint8_t P300_ACK_READ_BUDGET = 32;
 
 static inline void drain_uart_(uart::UARTDevice *uart) {
   while (uart != nullptr && uart->available()) {
@@ -60,7 +62,9 @@ OptolinkP300::OptolinkP300(uart::UARTDevice* uart) :
   _rcvBufferLen(0),
   _rcvLen(0),
   _initAckSawRx(false),
-  _initAckLastRx(0) {}
+  _initAckLastRx(0),
+  _initAckStartMs(0),
+  _initAckLastEnableTxMs(0) {}
 
 void OptolinkP300::begin() {
   _markHandshakeSuccess();
@@ -126,7 +130,7 @@ void OptolinkP300::_reset() {
 }
 
 void OptolinkP300::_resetAck() {
-  while (_uart->available()) {
+  for (uint8_t reads = 0; reads < P300_ACK_READ_BUDGET && _uart->available(); ++reads) {
     int rb = _uart->read();
     if (rb < 0) {
       break;
@@ -154,12 +158,16 @@ void OptolinkP300::_init() {
   _initAckLastRx = 0;
   const uint8_t buff[] = {0x16, 0x00, 0x00};
   _uart->write_array(buff, sizeof(buff));
-  _lastMillis = millis();
+  const uint32_t now = millis();
+  _lastMillis = now;
+  _initAckStartMs = now;
+  _initAckLastEnableTxMs = now;
   _state = INIT_ACK;
 }
 
 void OptolinkP300::_initAck() {
-  while (_uart->available()) {
+  const uint32_t now = millis();
+  for (uint8_t reads = 0; reads < P300_ACK_READ_BUDGET && _uart->available(); ++reads) {
     int rb = _uart->read();
     if (rb < 0) {
       break;
@@ -174,9 +182,23 @@ void OptolinkP300::_initAck() {
       _state = IDLE;
       return;
     }
+    if (b == 0x05) {
+      const uint32_t retry_now = millis();
+      if (retry_now - _initAckLastEnableTxMs >= P300_ENABLE_RETRY_MIN_MS) {
+        const uint8_t enable[] = {0x16, 0x00, 0x00};
+        _uart->write_array(enable, sizeof(enable));
+        _initAckLastEnableTxMs = retry_now;
+      }
+      continue;
+    }
+    if (b == 0x15) {
+      ESP_LOGW(TAG, "P300 enable got NACK (0x15), restarting handshake");
+      _markHandshakeFailure(TAG, now);
+      _state = RESET;
+      return;
+    }
   }
-  const uint32_t now = millis();
-  if (now - _lastMillis > P300_INIT_ACK_TIMEOUT_MS) {
+  if (now - _initAckStartMs > P300_INIT_ACK_TIMEOUT_MS) {
     if (_initAckSawRx) {
       ESP_LOGW(TAG, "P300 enable ACK timeout after %lu ms, last RX byte=0x%02X",
                static_cast<unsigned long>(P300_INIT_ACK_TIMEOUT_MS), _initAckLastRx);
