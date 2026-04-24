@@ -47,8 +47,9 @@ void OPTOLINKNumber::control(float value) {
 
   ESP_LOGD(TAG, "state of number %s to value: %f", this->get_name().c_str(), value);
 
+  this->_command_value = value;
+  this->_has_command_value = true;
   this->_last_update = millis();
-  publish_state(value);
 }
 
 void OPTOLINKNumber::decode(uint8_t* data, uint8_t length, Datapoint* dp) {
@@ -99,11 +100,15 @@ void OPTOLINKNumber::decode(uint8_t* data, uint8_t length, Datapoint* dp) {
 
   float value = ((float) iv) / this->_div_ratio;
   ESP_LOGD(TAG, "decode %s raw=%lld div_ratio=%f -> %f", this->get_name().c_str(), (long long) iv, (double) this->_div_ratio, value);
+  if (this->_has_command_value && fabsf(value - this->_command_value) < 0.0001f) {
+    this->_has_command_value = false;
+  }
+  this->_last_read_ms = millis();
   publish_state(value);
 }
 
 void OPTOLINKNumber::encode(uint8_t* raw, uint8_t length) {
-  float value = this->state;
+  float value = this->_has_command_value ? this->_command_value : this->state;
   encode(raw, length, value);
 }
 
