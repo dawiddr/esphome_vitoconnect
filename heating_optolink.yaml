@@ -1,0 +1,1040 @@
+substitutions:
+  name: viessmann-vitodens-optolink
+  friendly_name: Viessmann Vitodens
+
+  vitoconnect_update_interval: 60s
+
+  # Viessmann HK1 "Niveau" (parallel shift) is a signed integer in steps.
+  # Typical usable range is -13..+13 (device dependent).
+  hk1_niveau_min: "-13"
+  hk1_niveau_max: "13"
+
+  # Range exposed to Home Assistant for the optimizer curve-offset layer (fail-safe bounded).
+  hk1_niveau_offset_min: "-8"
+  hk1_niveau_offset_max: "8"
+
+  # Range exposed to Home Assistant for the optimizer heating-setpoint layer.
+  # Direct boiler setpoint entities retain the wider device-safe range below.
+  optimizer_heating_setpoint_min: "19"
+  optimizer_heating_setpoint_max: "25"
+  heating_setpoint_direct_min: "3"
+  heating_setpoint_direct_max: "30"
+  heating_setpoint_default_baseline: "22"
+
+  # Watchdog: revert to baseline if no heartbeat for this long (milliseconds).
+  optimizer_heartbeat_timeout_ms: "1800000"   # 30 minutes
+
+  # Internal rate limit for writes to the boiler (milliseconds).
+  optimizer_min_write_interval_ms: "120000"  # 2 minutes
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  build_path: esp32
+  platformio_options:
+    upload_speed: 115200
+
+  # Safe initialization: always start with offset=0 after reboot.
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          id(desired_offset) = 0;
+          id(last_heartbeat_ms) = 0;
+          id(last_apply_ms) = 0;
+          id(last_setpoint_apply_ms) = 0;
+          id(desired_heating_setpoint_target) = ${heating_setpoint_default_baseline};
+          id(watchdog_tripped) = false;
+          id(boot_baseline_enforced) = false;
+          id(boot_setpoint_baseline_enforced) = false;
+
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: esp32c3
+  framework:
+    type: esp-idf
+
+# Use the write-enabled vitoconnect fork shipped in this artifact ZIP.
+# Folder layout (relative to this YAML):
+#   ./external_components/esphome_vitoconnect/components/vitoconnect/...
+external_components:
+  - source:
+      type: local
+      path: ./components
+    components: [vitoconnect]
+
+logger:
+  hardware_uart: UART0
+  level: DEBUG   # if you ever see UART timeouts again, try INFO
+
+uart:
+  - id: uart_vitoconnect
+    rx_pin: GPIO05
+    tx_pin: GPIO02
+    baud_rate: 4800
+    data_bits: 8
+    parity: EVEN
+    stop_bits: 2
+
+vitoconnect:
+  id: vito
+  uart_id: uart_vitoconnect
+  protocol: P300
+  update_interval: ${vitoconnect_update_interval}
+
+  # Supported by the included fork.
+  verify_writes: true
+  max_write_failures: 3
+
+# -----------------------------------------------------------------------------
+# Globals used by the fail-safe optimizer layer
+# -----------------------------------------------------------------------------
+globals:
+  # Stored safe baseline for HK1 Niveau (persisted across reboots).
+  - id: baseline_hk1_niveau
+    type: float
+    restore_value: yes
+    initial_value: "0"
+
+  - id: baseline_valid
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+
+  # Stored safe baselines for HK1 heating setpoints (persisted across reboots).
+  # These are restored on watchdog trip, HA/API loss, optimizer disable, and safe boot.
+  - id: baseline_heating_setpoint_normal
+    type: float
+    restore_value: yes
+    initial_value: "${heating_setpoint_default_baseline}"
+
+  - id: baseline_heating_setpoint_reduced
+    type: float
+    restore_value: yes
+    initial_value: "${heating_setpoint_default_baseline}"
+
+  - id: setpoint_baseline_valid
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+
+  # Whether HA has explicitly armed heating-setpoint control mode.
+  # This is persisted so an ESP reboot during setpoint-control mode can safely
+  # restore setpoint baselines on boot. HA turns it off when curve mode is active.
+  - id: setpoint_control_armed
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+
+  # Current requested optimizer offset (volatile; always starts at 0 after reboot).
+  - id: desired_offset
+    type: float
+    restore_value: no
+    initial_value: "0"
+
+  # Current requested optimizer heating setpoint target (volatile; safe boot restores baseline).
+  - id: desired_heating_setpoint_target
+    type: float
+    restore_value: no
+    initial_value: "${heating_setpoint_default_baseline}"
+
+  # Watchdog timestamps / state (volatile).
+  - id: last_heartbeat_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: last_apply_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: last_setpoint_apply_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: watchdog_tripped
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: boot_baseline_enforced
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: boot_setpoint_baseline_enforced
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+# -----------------------------------------------------------------------------
+# Scripts
+# -----------------------------------------------------------------------------
+script:
+  - id: apply_curve
+    mode: queued
+    then:
+      - lambda: |-
+          if (!id(baseline_valid)) {
+            ESP_LOGW("optimizer", "Baseline HK1 Niveau not known yet; skipping curve apply.");
+            return;
+          }
+          if (!id(optimizer_enabled).state) {
+            ESP_LOGD("optimizer", "Optimizer disabled; skipping curve apply.");
+            return;
+          }
+
+          const uint32_t now = millis();
+          const uint32_t min_interval = (uint32_t) ${optimizer_min_write_interval_ms};
+
+          float target = id(baseline_hk1_niveau) + id(desired_offset);
+          if (target < ${hk1_niveau_min}) target = ${hk1_niveau_min};
+          if (target > ${hk1_niveau_max}) target = ${hk1_niveau_max};
+
+          const float current = id(hk1_niveau_direct).state;
+          if (!isnan(current) && fabsf(current - target) < 0.01f) {
+            ESP_LOGD("optimizer", "HK1 Niveau already %.0f -> no write.", target);
+            return;
+          }
+
+          if (id(last_apply_ms) != 0 && (uint32_t)(now - id(last_apply_ms)) < min_interval) {
+            ESP_LOGD("optimizer", "Curve write rate-limited; pending target remains %.0f (%u ms since last write).",
+                     target, (unsigned) (now - id(last_apply_ms)));
+            return;
+          }
+
+          ESP_LOGI("optimizer", "Writing HK1 Niveau: target=%.0f (baseline=%.0f offset=%.0f)",
+                   target, id(baseline_hk1_niveau), id(desired_offset));
+          id(hk1_niveau_direct).control(target);
+          id(last_apply_ms) = now;
+
+  - id: apply_heating_setpoint
+    mode: queued
+    then:
+      - lambda: |-
+          if (!id(setpoint_baseline_valid)) {
+            ESP_LOGW("optimizer", "Heating setpoint baseline not known yet; skipping setpoint apply.");
+            return;
+          }
+          if (!id(optimizer_enabled).state) {
+            ESP_LOGD("optimizer", "Optimizer disabled; skipping setpoint apply.");
+            return;
+          }
+          if (!id(setpoint_control_armed)) {
+            ESP_LOGD("optimizer", "Heating setpoint control is not armed; skipping setpoint apply.");
+            return;
+          }
+
+          const uint32_t now = millis();
+          const uint32_t min_interval = (uint32_t) ${optimizer_min_write_interval_ms};
+
+          float target = id(desired_heating_setpoint_target);
+          if (target < ${optimizer_heating_setpoint_min}) target = ${optimizer_heating_setpoint_min};
+          if (target > ${optimizer_heating_setpoint_max}) target = ${optimizer_heating_setpoint_max};
+          if (target < ${heating_setpoint_direct_min}) target = ${heating_setpoint_direct_min};
+          if (target > ${heating_setpoint_direct_max}) target = ${heating_setpoint_direct_max};
+
+          if (fabsf(id(desired_heating_setpoint_target) - target) > 0.01f) {
+            id(desired_heating_setpoint_target) = target;
+            id(heating_setpoint_target_optimizer).publish_state(target);
+          }
+
+          const float cur_normal = id(heating_setpoint_normal_direct).state;
+          const float cur_reduced = id(heating_setpoint_reduced_direct).state;
+          const bool normal_ok = !isnan(cur_normal) && fabsf(cur_normal - target) < 0.01f;
+          const bool reduced_ok = !isnan(cur_reduced) && fabsf(cur_reduced - target) < 0.01f;
+          if (normal_ok && reduced_ok) {
+            ESP_LOGD("optimizer", "Heating setpoints already %.0f/%.0f -> no write.", target, target);
+            return;
+          }
+
+          if (id(last_setpoint_apply_ms) != 0 &&
+              (uint32_t)(now - id(last_setpoint_apply_ms)) < min_interval) {
+            ESP_LOGD("optimizer", "Heating setpoint write rate-limited; pending target remains %.0f (%u ms since last write).",
+                     target, (unsigned) (now - id(last_setpoint_apply_ms)));
+            return;
+          }
+
+          ESP_LOGI("optimizer", "Writing heating setpoints: normal=%.0f reduced=%.0f", target, target);
+          id(heating_setpoint_normal_direct).control(target);
+          id(heating_setpoint_reduced_direct).control(target);
+          id(last_setpoint_apply_ms) = now;
+
+  - id: restore_heating_setpoints_to_baseline
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(setpoint_baseline_valid)) {
+            const uint32_t now = millis();
+            const float target_normal = id(baseline_heating_setpoint_normal);
+            const float target_reduced = id(baseline_heating_setpoint_reduced);
+            id(desired_heating_setpoint_target) = target_normal;
+            id(heating_setpoint_target_optimizer).publish_state(target_normal);
+
+            const float cur_normal = id(heating_setpoint_normal_direct).state;
+            const float cur_reduced = id(heating_setpoint_reduced_direct).state;
+            const bool normal_ok = !isnan(cur_normal) && fabsf(cur_normal - target_normal) < 0.01f;
+            const bool reduced_ok = !isnan(cur_reduced) && fabsf(cur_reduced - target_reduced) < 0.01f;
+            if (normal_ok && reduced_ok) {
+              ESP_LOGD("optimizer", "Heating setpoints already at baseline %.0f/%.0f -> no write.",
+                       target_normal, target_reduced);
+            } else {
+              ESP_LOGI("optimizer", "Restoring heating setpoints to baseline normal=%.0f reduced=%.0f",
+                       target_normal, target_reduced);
+              id(heating_setpoint_normal_direct).control(target_normal);
+              id(heating_setpoint_reduced_direct).control(target_reduced);
+              id(last_setpoint_apply_ms) = now;
+            }
+          } else {
+            ESP_LOGW("optimizer", "Heating setpoint baseline not known yet; cannot restore setpoints.");
+          }
+
+  - id: revert_to_baseline
+    mode: restart
+    then:
+      - lambda: |-
+          id(desired_offset) = 0;
+          id(setpoint_control_armed) = false;
+          id(watchdog_tripped) = false;
+          id(hk1_niveau_offset).publish_state(0);
+          id(heating_setpoint_control_armed).publish_state(false);
+
+          const uint32_t now = millis();
+
+          if (id(baseline_valid)) {
+            const float target = id(baseline_hk1_niveau);
+            const float current = id(hk1_niveau_direct).state;
+            if (!isnan(current) && fabsf(current - target) < 0.01f) {
+              ESP_LOGD("optimizer", "HK1 Niveau already at baseline %.0f -> no write.", target);
+            } else {
+              ESP_LOGI("optimizer", "Reverting HK1 Niveau to baseline %.0f", target);
+              id(hk1_niveau_direct).control(target);
+              id(last_apply_ms) = now;
+            }
+          } else {
+            ESP_LOGW("optimizer", "Baseline HK1 Niveau not known yet; cannot revert curve.");
+          }
+
+          if (id(setpoint_baseline_valid)) {
+            const float target_normal = id(baseline_heating_setpoint_normal);
+            const float target_reduced = id(baseline_heating_setpoint_reduced);
+            id(desired_heating_setpoint_target) = target_normal;
+            id(heating_setpoint_target_optimizer).publish_state(target_normal);
+
+            const float cur_normal = id(heating_setpoint_normal_direct).state;
+            const float cur_reduced = id(heating_setpoint_reduced_direct).state;
+            const bool normal_ok = !isnan(cur_normal) && fabsf(cur_normal - target_normal) < 0.01f;
+            const bool reduced_ok = !isnan(cur_reduced) && fabsf(cur_reduced - target_reduced) < 0.01f;
+            if (normal_ok && reduced_ok) {
+              ESP_LOGD("optimizer", "Heating setpoints already at baseline %.0f/%.0f -> no write.",
+                       target_normal, target_reduced);
+            } else {
+              ESP_LOGI("optimizer", "Reverting heating setpoints to baseline normal=%.0f reduced=%.0f",
+                       target_normal, target_reduced);
+              id(heating_setpoint_normal_direct).control(target_normal);
+              id(heating_setpoint_reduced_direct).control(target_reduced);
+              id(last_setpoint_apply_ms) = now;
+            }
+          } else {
+            ESP_LOGW("optimizer", "Heating setpoint baseline not known yet; cannot revert setpoints.");
+          }
+
+# -----------------------------------------------------------------------------
+# Fail-safe optimizer interface for Home Assistant
+# -----------------------------------------------------------------------------
+switch:
+  - platform: template
+    name: "Boiler optimizer enabled"
+    id: optimizer_enabled
+    entity_category: config
+    icon: mdi:tune
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(last_heartbeat_ms) = millis();
+          id(watchdog_tripped) = false;
+      - script.execute: apply_curve
+      - if:
+          condition:
+            lambda: |-
+              return id(setpoint_control_armed);
+          then:
+            - script.execute: apply_heating_setpoint
+    turn_off_action:
+      - script.execute: revert_to_baseline
+
+  - platform: template
+    name: "Heating setpoint control armed"
+    id: heating_setpoint_control_armed
+    entity_category: config
+    icon: mdi:shield-check
+    lambda: |-
+      return id(setpoint_control_armed);
+    turn_on_action:
+      - lambda: |-
+          if (!id(setpoint_baseline_valid)) {
+            id(setpoint_control_armed) = false;
+            id(heating_setpoint_control_armed).publish_state(false);
+            ESP_LOGW("optimizer", "Heating setpoint control arm requested but no setpoint baseline is known; refusing to arm.");
+            return;
+          }
+
+          // Avoid applying a stale target that may have been written while setpoint
+          // control was disarmed. Arming always starts from the captured safe baseline;
+          // HA may write a new optimizer target after the mode transition is complete.
+          const float baseline = id(baseline_heating_setpoint_normal);
+          id(desired_heating_setpoint_target) = baseline;
+          id(heating_setpoint_target_optimizer).publish_state(baseline);
+
+          id(setpoint_control_armed) = true;
+          id(last_heartbeat_ms) = millis();
+          id(watchdog_tripped) = false;
+          ESP_LOGI("optimizer", "Heating setpoint control armed by HA; staged baseline target %.0fC.", baseline);
+      - script.execute: apply_heating_setpoint
+    turn_off_action:
+      - lambda: |-
+          id(setpoint_control_armed) = false;
+          ESP_LOGI("optimizer", "Heating setpoint control disarmed; restoring heating setpoint baselines.");
+      - script.execute: restore_heating_setpoints_to_baseline
+
+number:
+  # Bounded curve-offset control surface for legacy/Niveau mode.
+  - platform: template
+    name: "HK1 Niveau offset (optimizer)"
+    id: hk1_niveau_offset
+    entity_category: config
+    icon: mdi:chart-bell-curve
+    min_value: ${hk1_niveau_offset_min}
+    max_value: ${hk1_niveau_offset_max}
+    step: 1
+    mode: slider
+    restore_value: no
+    optimistic: true
+    set_action:
+      - lambda: |-
+          id(desired_offset) = x;
+          id(last_heartbeat_ms) = millis();
+          id(watchdog_tripped) = false;
+      - script.execute: apply_curve
+
+  # Bounded setpoint-control surface. The ESP writes this target to both
+  # Viessmann normal and reduced heating setpoints.
+  - platform: template
+    name: "Heating setpoint target (optimizer)"
+    id: heating_setpoint_target_optimizer
+    entity_category: config
+    icon: mdi:thermostat
+    min_value: ${optimizer_heating_setpoint_min}
+    max_value: ${optimizer_heating_setpoint_max}
+    step: 1
+    mode: slider
+    restore_value: no
+    optimistic: true
+    set_action:
+      - lambda: |-
+          if (!id(setpoint_control_armed)) {
+            const float safe_target = id(setpoint_baseline_valid)
+              ? id(baseline_heating_setpoint_normal)
+              : (float) ${heating_setpoint_default_baseline};
+            id(desired_heating_setpoint_target) = safe_target;
+            id(heating_setpoint_target_optimizer).publish_state(safe_target);
+            ESP_LOGW("optimizer", "Ignoring setpoint target %.0f while setpoint control is not armed; safe target remains %.0f.", x, safe_target);
+            return;
+          }
+          id(desired_heating_setpoint_target) = x;
+          id(last_heartbeat_ms) = millis();
+          id(watchdog_tripped) = false;
+      - script.execute: apply_heating_setpoint
+
+  # --- Direct boiler writeables (disabled by default; use with care) ---------
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    id: hk1_neigung_direct
+    name: "HK1 Neigung (slope) ⚠ direct"
+    entity_category: diagnostic
+    disabled_by_default: true
+    address: 0x27D3
+    length: 1
+    min_value: 0.2
+    max_value: 3.5
+    step: 0.1
+    div_ratio: 10
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    id: hk1_niveau_direct
+    name: "HK1 Niveau (shift) ⚠ direct"
+    entity_category: diagnostic
+    disabled_by_default: true
+    address: 0x27D4
+    length: 1
+    min_value: ${hk1_niveau_min}
+    max_value: ${hk1_niveau_max}
+    step: 1
+    signed: true
+
+  # Setpoint-control mode writes both normal and reduced. HA should write only
+  # "Heating setpoint target (optimizer)" during normal operation.
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    id: heating_setpoint_normal_direct
+    name: "Heating setpoint normal ⚠ direct"
+    entity_category: diagnostic
+    disabled_by_default: true
+    address: 0x2306
+    length: 1
+    min_value: ${heating_setpoint_direct_min}
+    max_value: ${heating_setpoint_direct_max}
+    step: 1
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    id: heating_setpoint_reduced_direct
+    name: "Heating setpoint reduced ⚠ direct"
+    entity_category: diagnostic
+    disabled_by_default: true
+    address: 0x2307
+    length: 1
+    min_value: ${heating_setpoint_direct_min}
+    max_value: ${heating_setpoint_direct_max}
+    step: 1
+
+button:
+  - platform: template
+    name: "Optimizer heartbeat"
+    id: optimizer_heartbeat
+    entity_category: diagnostic
+    icon: mdi:heart-pulse
+    on_press:
+      - lambda: |-
+          id(last_heartbeat_ms) = millis();
+          id(watchdog_tripped) = false;
+
+  - platform: template
+    name: "Revert boiler controls to baseline"
+    id: revert_baseline_button
+    entity_category: config
+    icon: mdi:backup-restore
+    on_press:
+      - script.execute: revert_to_baseline
+
+  - platform: template
+    name: "Set optimizer baselines from current boiler"
+    id: set_baseline_from_current
+    entity_category: config
+    icon: mdi:content-save
+    on_press:
+      - lambda: |-
+          bool captured_any = false;
+
+          const float current_niveau = id(hk1_niveau_direct).state;
+          if (!isnan(current_niveau)) {
+            id(baseline_hk1_niveau) = current_niveau;
+            id(baseline_valid) = true;
+            captured_any = true;
+            ESP_LOGI("optimizer", "Baseline HK1 Niveau set to %.0f", id(baseline_hk1_niveau));
+          } else {
+            ESP_LOGW("optimizer", "Cannot set HK1 Niveau baseline: no state yet.");
+          }
+
+          const float current_normal = id(heating_setpoint_normal_direct).state;
+          const float current_reduced = id(heating_setpoint_reduced_direct).state;
+          if (!isnan(current_normal) && !isnan(current_reduced)) {
+            id(baseline_heating_setpoint_normal) = current_normal;
+            id(baseline_heating_setpoint_reduced) = current_reduced;
+            id(setpoint_baseline_valid) = true;
+            id(desired_heating_setpoint_target) = current_normal;
+            id(heating_setpoint_target_optimizer).publish_state(current_normal);
+            captured_any = true;
+            ESP_LOGI("optimizer", "Heating setpoint baselines set to normal=%.0f reduced=%.0f",
+                     current_normal, current_reduced);
+          } else {
+            ESP_LOGW("optimizer", "Cannot set heating setpoint baselines: normal/reduced state unavailable.");
+          }
+
+          if (captured_any) {
+            id(watchdog_tripped) = false;
+          }
+      - script.execute: revert_to_baseline
+
+# -----------------------------------------------------------------------------
+# Sensors (original + optimizer diagnostics)
+# -----------------------------------------------------------------------------
+sensor:
+  # 2‑byte device identification value (kept internal; exposed as hex text below)
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    entity_category: diagnostic
+    id: device_id_raw
+    name: "Device ID (raw)"
+    address: 0x00F8
+    length: 2
+    internal: true
+
+  # Temperatures (/10)
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    name: "Outdoor temperature"
+    address: 0x5525
+    length: 2
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters: [ { multiply: 0.1 } ]
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    name: "Boiler temperature"
+    address: 0x0802
+    length: 2
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters: [ { multiply: 0.1 } ]
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    name: "Boiler setpoint"
+    address: 0x555A
+    length: 2
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters: [ { multiply: 0.1 } ]
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    name: "DHW setpoint"
+    address: 0x6300
+    length: 1
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    name: "DHW tank temperature"
+    address: 0x0804
+    length: 2
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters: [ { multiply: 0.1 } ]
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    name: "DHW outlet temperature"
+    address: 0x0814
+    length: 2
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters: [ { multiply: 0.1 } ]
+
+  # Read-only UI sensors backed by the direct writeable numbers above.
+  # This avoids registering duplicate vitoconnect datapoints for the same Optolink addresses.
+  - platform: template
+    name: "Heating setpoint (normal)"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      const float v = id(heating_setpoint_normal_direct).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    name: "Heating setpoint (reduced)"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      const float v = id(heating_setpoint_reduced_direct).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    name: "Heating flow setpoint"
+    address: 0x2544
+    length: 2
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters: [ { multiply: 0.1 } ]
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    name: "Heating flow temperature"
+    address: 0x2900
+    length: 2
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters: [ { multiply: 0.1 } ]
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    name: "Flue gas temperature"
+    address: 0x0808
+    length: 2
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters: [ { multiply: 0.1 } ]
+
+  # NOTE:
+  # The address 0xA38F is listed in vito.xml as len=2 for some devices. Your existing setup
+  # uses len=1 with *0.5 scaling and reports realistic values (see entities.csv), so we keep it unchanged.
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    name: "Burner power"
+    address: 0xA38F
+    length: 1
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 1
+    filters: [ { multiply: 0.5 } ]
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    entity_category: diagnostic
+    name: "Burner starts"
+    address: 0x088A
+    length: 4
+    icon: mdi:counter
+    state_class: total_increasing
+    accuracy_decimals: 0
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    entity_category: diagnostic
+    name: "Burner runtime"
+    address: 0x08A7
+    length: 4
+    unit_of_measurement: "h"
+    icon: mdi:timer-outline
+    state_class: total_increasing
+    accuracy_decimals: 1
+    filters:
+      - lambda: return x / 3600.0;
+
+  # --- Optimizer diagnostics -------------------------------------------------
+  - platform: template
+    name: "HK1 Niveau baseline"
+    id: hk1_niveau_baseline
+    entity_category: diagnostic
+    unit_of_measurement: "step"
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      if (!id(baseline_valid)) return NAN;
+      return id(baseline_hk1_niveau);
+
+  - platform: template
+    name: "HK1 Niveau effective target"
+    id: hk1_niveau_effective_target
+    entity_category: diagnostic
+    unit_of_measurement: "step"
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      if (!id(baseline_valid)) return NAN;
+      float t = id(baseline_hk1_niveau) + id(desired_offset);
+      if (t < ${hk1_niveau_min}) t = ${hk1_niveau_min};
+      if (t > ${hk1_niveau_max}) t = ${hk1_niveau_max};
+      return t;
+
+  - platform: template
+    name: "Heating setpoint baseline normal"
+    id: heating_setpoint_baseline_normal_sensor
+    entity_category: diagnostic
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      if (!id(setpoint_baseline_valid)) return NAN;
+      return id(baseline_heating_setpoint_normal);
+
+  - platform: template
+    name: "Heating setpoint baseline reduced"
+    id: heating_setpoint_baseline_reduced_sensor
+    entity_category: diagnostic
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      if (!id(setpoint_baseline_valid)) return NAN;
+      return id(baseline_heating_setpoint_reduced);
+
+  - platform: template
+    name: "Heating setpoint effective target"
+    id: heating_setpoint_effective_target
+    entity_category: diagnostic
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      float t = id(desired_heating_setpoint_target);
+      if (t < ${optimizer_heating_setpoint_min}) t = ${optimizer_heating_setpoint_min};
+      if (t > ${optimizer_heating_setpoint_max}) t = ${optimizer_heating_setpoint_max};
+      if (t < ${heating_setpoint_direct_min}) t = ${heating_setpoint_direct_min};
+      if (t > ${heating_setpoint_direct_max}) t = ${heating_setpoint_direct_max};
+      return t;
+
+  - platform: template
+    name: "Optimizer heartbeat age"
+    id: optimizer_heartbeat_age
+    entity_category: diagnostic
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      if (id(last_heartbeat_ms) == 0) return NAN;
+      return (uint32_t)(millis() - id(last_heartbeat_ms)) / 1000.0f;
+
+binary_sensor:
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    name: "Heating circuit pump active"
+    address: 0x2906
+    device_class: running
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    name: "Burner active"
+    address: 0x55D3
+    device_class: running
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    entity_category: diagnostic
+    name: "Burner fault"
+    address: 0x0883
+    device_class: problem
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    entity_category: diagnostic
+    name: "General fault"
+    address: 0x0A82
+    device_class: problem
+
+  - platform: template
+    name: "Optimizer watchdog tripped"
+    id: optimizer_watchdog_tripped
+    entity_category: diagnostic
+    device_class: problem
+    lambda: |-
+      return id(watchdog_tripped);
+
+text_sensor:
+  - platform: template
+    name: "Device ID"
+    entity_category: diagnostic
+    update_interval: ${vitoconnect_update_interval}
+    lambda: |-
+      if (!id(device_id_raw).has_state()) return {};
+      int32_t s = (int32_t) id(device_id_raw).state;
+      uint16_t u = (uint16_t) s;
+      uint16_t swapped = (uint16_t)((u << 8) | (u >> 8));
+      char buf[32];
+      snprintf(buf, sizeof(buf), "0x%04X (openv 0x%04X)", u, swapped);
+      return std::string(buf);
+
+# -----------------------------------------------------------------------------
+# Watchdog + baseline capture / boot enforcement
+# -----------------------------------------------------------------------------
+interval:
+  # Capture baselines once (only if they have not been stored yet).
+  # Also enforce safe start after reboot. Curve and setpoint baselines are
+  # enforced independently so one missing datapoint does not block the other.
+  - interval: 10s
+    then:
+      - lambda: |-
+          // Curve baseline capture
+          if (!id(baseline_valid)) {
+            const float cur = id(hk1_niveau_direct).state;
+            if (!isnan(cur)) {
+              id(baseline_hk1_niveau) = cur;
+              id(baseline_valid) = true;
+              ESP_LOGI("optimizer", "Captured baseline HK1 Niveau from boiler: %.0f",
+                       id(baseline_hk1_niveau));
+            }
+          }
+
+          // Heating setpoint baseline capture
+          if (!id(setpoint_baseline_valid)) {
+            const float cur_normal = id(heating_setpoint_normal_direct).state;
+            const float cur_reduced = id(heating_setpoint_reduced_direct).state;
+            if (!isnan(cur_normal) && !isnan(cur_reduced)) {
+              id(baseline_heating_setpoint_normal) = cur_normal;
+              id(baseline_heating_setpoint_reduced) = cur_reduced;
+              id(setpoint_baseline_valid) = true;
+              id(desired_heating_setpoint_target) = cur_normal;
+              id(heating_setpoint_target_optimizer).publish_state(cur_normal);
+              ESP_LOGI("optimizer", "Captured heating setpoint baselines: normal=%.0f reduced=%.0f",
+                       cur_normal, cur_reduced);
+            }
+          }
+
+          // Curve boot enforcement (only once)
+          if (id(baseline_valid) && !id(boot_baseline_enforced)) {
+            const float cur = id(hk1_niveau_direct).state;
+            if (!isnan(cur)) {
+              id(boot_baseline_enforced) = true;
+              id(desired_offset) = 0;
+              id(hk1_niveau_offset).publish_state(0);
+
+              if (!id(optimizer_enabled).state) {
+                ESP_LOGI("optimizer", "Boot: optimizer disabled -> not enforcing HK1 Niveau baseline.");
+              } else {
+                const float target = id(baseline_hk1_niveau);
+                if (fabsf(cur - target) > 0.01f) {
+                  ESP_LOGI("optimizer", "Boot: enforcing baseline HK1 Niveau %.0f (current %.0f)", target, cur);
+                  id(hk1_niveau_direct).control(target);
+                  id(last_apply_ms) = millis();
+                } else {
+                  ESP_LOGD("optimizer", "Boot: HK1 Niveau already at baseline %.0f", target);
+                }
+              }
+            }
+          }
+
+          // Heating setpoint boot enforcement (only once)
+          if (id(setpoint_baseline_valid) && !id(boot_setpoint_baseline_enforced)) {
+            const float cur_normal = id(heating_setpoint_normal_direct).state;
+            const float cur_reduced = id(heating_setpoint_reduced_direct).state;
+            if (!isnan(cur_normal) && !isnan(cur_reduced)) {
+              id(boot_setpoint_baseline_enforced) = true;
+              const float target_normal = id(baseline_heating_setpoint_normal);
+              const float target_reduced = id(baseline_heating_setpoint_reduced);
+              id(desired_heating_setpoint_target) = target_normal;
+              id(heating_setpoint_target_optimizer).publish_state(target_normal);
+
+              if (!id(optimizer_enabled).state) {
+                ESP_LOGI("optimizer", "Boot: optimizer disabled -> not enforcing heating setpoint baselines.");
+              } else if (!id(setpoint_control_armed)) {
+                ESP_LOGI("optimizer", "Boot: setpoint control not armed -> not enforcing heating setpoint baselines.");
+              } else {
+                const bool normal_ok = fabsf(cur_normal - target_normal) < 0.01f;
+                const bool reduced_ok = fabsf(cur_reduced - target_reduced) < 0.01f;
+                if (!normal_ok || !reduced_ok) {
+                  ESP_LOGI("optimizer", "Boot: setpoint control armed -> enforcing heating setpoint baselines normal=%.0f reduced=%.0f",
+                           target_normal, target_reduced);
+                  id(heating_setpoint_normal_direct).control(target_normal);
+                  id(heating_setpoint_reduced_direct).control(target_reduced);
+                  id(last_setpoint_apply_ms) = millis();
+                } else {
+                  ESP_LOGD("optimizer", "Boot: heating setpoints already at baseline %.0f/%.0f",
+                           target_normal, target_reduced);
+                }
+              }
+
+              if (id(setpoint_control_armed)) {
+                id(setpoint_control_armed) = false;
+                id(heating_setpoint_control_armed).publish_state(false);
+                ESP_LOGI("optimizer", "Boot: setpoint control disarmed after safe baseline handling.");
+              }
+            }
+          }
+
+  # Heartbeat watchdog: revert to baselines if HA stops sending heartbeats.
+  - interval: 30s
+    then:
+      - lambda: |-
+          if (!id(baseline_valid) && !id(setpoint_baseline_valid)) return;
+          if (!id(optimizer_enabled).state) return;
+          if (id(watchdog_tripped)) return;
+          if (id(last_heartbeat_ms) == 0) return;
+
+          const uint32_t now = millis();
+          const uint32_t timeout_ms = (uint32_t) ${optimizer_heartbeat_timeout_ms};
+          if ((uint32_t)(now - id(last_heartbeat_ms)) > timeout_ms) {
+            id(watchdog_tripped) = true;
+            ESP_LOGW("optimizer", "Watchdog: heartbeat stale (%u s) -> revert optimizer outputs to baseline",
+                     (unsigned) ((now - id(last_heartbeat_ms)) / 1000));
+
+            id(desired_offset) = 0;
+            id(hk1_niveau_offset).publish_state(0);
+
+            if (id(baseline_valid)) {
+              id(hk1_niveau_direct).control(id(baseline_hk1_niveau));
+              id(last_apply_ms) = now;
+            }
+
+            if (id(setpoint_control_armed) && id(setpoint_baseline_valid)) {
+              const float target_normal = id(baseline_heating_setpoint_normal);
+              const float target_reduced = id(baseline_heating_setpoint_reduced);
+              id(desired_heating_setpoint_target) = target_normal;
+              id(heating_setpoint_target_optimizer).publish_state(target_normal);
+              id(heating_setpoint_normal_direct).control(target_normal);
+              id(heating_setpoint_reduced_direct).control(target_reduced);
+              id(last_setpoint_apply_ms) = now;
+            }
+            id(setpoint_control_armed) = false;
+            id(heating_setpoint_control_armed).publish_state(false);
+          }
+
+  # Reconcile pending optimizer targets. This prevents a rate-limited write from
+  # being lost while the HA-facing template number remains optimistic.
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(optimizer_enabled).state && !id(watchdog_tripped) && id(last_heartbeat_ms) != 0;
+          then:
+            - script.execute: apply_curve
+            - if:
+                condition:
+                  lambda: |-
+                    return id(setpoint_control_armed);
+                then:
+                  - script.execute: apply_heating_setpoint
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Don't reboot if Wi-Fi is down (fail-safe: boiler should keep heating regardless).
+  reboot_timeout: 0s
+
+  # Fallback AP for local recovery.
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret wifi_ap_password
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret esphome_api_encryption_key
+
+  # Don't reboot if HA/API is down. The optimizer watchdog is refreshed only
+  # by the explicit heartbeat button or by actual optimizer control writes,
+  # not by a generic API reconnect.
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret esphome_ota_password
