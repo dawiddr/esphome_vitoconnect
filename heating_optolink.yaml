@@ -49,6 +49,19 @@ esphome:
           id(desired_heating_setpoint_target) = ${heating_setpoint_default_baseline};
           id(boot_baseline_enforced) = false;
           id(boot_setpoint_baseline_enforced) = false;
+          const float normal = id(baseline_heating_setpoint_normal);
+          const float reduced = id(baseline_heating_setpoint_reduced);
+          const bool baseline_ok =
+            !isnan(normal) && !isnan(reduced) &&
+            normal >= ${optimizer_heating_setpoint_min} && normal <= ${optimizer_heating_setpoint_max} &&
+            reduced >= ${optimizer_heating_setpoint_min} && reduced <= ${optimizer_heating_setpoint_max};
+          if (id(setpoint_baseline_valid) && !baseline_ok) {
+            ESP_LOGW("optimizer", "Discarding invalid persisted heating setpoint baseline %.0f/%.0f; refusing setpoint writes until a valid readback is captured.",
+                     normal, reduced);
+            id(setpoint_baseline_valid) = false;
+            id(baseline_heating_setpoint_normal) = ${heating_setpoint_default_baseline};
+            id(baseline_heating_setpoint_reduced) = ${heating_setpoint_default_baseline};
+          }
 
 esp32:
   board: esp32-c3-devkitm-1
@@ -269,7 +282,15 @@ script:
     mode: restart
     then:
       - lambda: |-
-          if (id(setpoint_baseline_valid)) {
+          const bool baseline_ok =
+            id(setpoint_baseline_valid) &&
+            !isnan(id(baseline_heating_setpoint_normal)) &&
+            !isnan(id(baseline_heating_setpoint_reduced)) &&
+            id(baseline_heating_setpoint_normal) >= ${optimizer_heating_setpoint_min} &&
+            id(baseline_heating_setpoint_normal) <= ${optimizer_heating_setpoint_max} &&
+            id(baseline_heating_setpoint_reduced) >= ${optimizer_heating_setpoint_min} &&
+            id(baseline_heating_setpoint_reduced) <= ${optimizer_heating_setpoint_max};
+          if (baseline_ok) {
             const uint32_t now = millis();
             const float target_normal = id(baseline_heating_setpoint_normal);
             const float target_reduced = id(baseline_heating_setpoint_reduced);
@@ -291,6 +312,7 @@ script:
             id(heating_setpoint_reduced_direct).control(target_reduced);
             id(last_setpoint_apply_ms) = now;
           } else {
+            id(setpoint_baseline_valid) = false;
             ESP_LOGW("optimizer", "Heating setpoint baseline not known yet; cannot restore setpoints.");
           }
 
@@ -314,7 +336,15 @@ script:
 
           const uint32_t now = millis();
 
-          if (id(setpoint_baseline_valid)) {
+          const bool baseline_ok =
+            id(setpoint_baseline_valid) &&
+            !isnan(id(baseline_heating_setpoint_normal)) &&
+            !isnan(id(baseline_heating_setpoint_reduced)) &&
+            id(baseline_heating_setpoint_normal) >= ${optimizer_heating_setpoint_min} &&
+            id(baseline_heating_setpoint_normal) <= ${optimizer_heating_setpoint_max} &&
+            id(baseline_heating_setpoint_reduced) >= ${optimizer_heating_setpoint_min} &&
+            id(baseline_heating_setpoint_reduced) <= ${optimizer_heating_setpoint_max};
+          if (baseline_ok) {
             const float target_normal = id(baseline_heating_setpoint_normal);
             const float target_reduced = id(baseline_heating_setpoint_reduced);
             id(desired_heating_setpoint_target) = target_normal;
@@ -335,6 +365,7 @@ script:
             id(heating_setpoint_reduced_direct).control(target_reduced);
             id(last_setpoint_apply_ms) = now;
           } else {
+            id(setpoint_baseline_valid) = false;
             ESP_LOGW("optimizer", "Heating setpoint baseline not known yet; cannot revert setpoints.");
           }
 
@@ -376,6 +407,18 @@ switch:
             ESP_LOGW("optimizer", "Heating setpoint control arm requested but no setpoint baseline is known; refusing to arm.");
             return;
           }
+          const float baseline = id(baseline_heating_setpoint_normal);
+          const float baseline_reduced = id(baseline_heating_setpoint_reduced);
+          if (isnan(baseline) || isnan(baseline_reduced) ||
+              baseline < ${optimizer_heating_setpoint_min} || baseline > ${optimizer_heating_setpoint_max} ||
+              baseline_reduced < ${optimizer_heating_setpoint_min} || baseline_reduced > ${optimizer_heating_setpoint_max}) {
+            id(setpoint_baseline_valid) = false;
+            id(setpoint_control_armed) = false;
+            id(heating_setpoint_control_armed).publish_state(false);
+            ESP_LOGW("optimizer", "Heating setpoint control arm requested with invalid baseline %.0f/%.0f; refusing to arm.",
+                     baseline, baseline_reduced);
+            return;
+          }
           if (id(watchdog_tripped)) {
             id(setpoint_control_armed) = false;
             id(heating_setpoint_control_armed).publish_state(false);
@@ -386,7 +429,6 @@ switch:
           // Avoid applying a stale target that may have been written while setpoint
           // control was disarmed. Arming always starts from the captured safe baseline;
           // HA may write a new optimizer target after the mode transition is complete.
-          const float baseline = id(baseline_heating_setpoint_normal);
           id(desired_heating_setpoint_target) = baseline;
           id(heating_setpoint_target_optimizer).publish_state(baseline);
 
@@ -565,7 +607,15 @@ button:
 
           const float current_normal = id(heating_setpoint_normal_direct).state;
           const float current_reduced = id(heating_setpoint_reduced_direct).state;
-          if (!isnan(current_normal) && !isnan(current_reduced)) {
+          const bool current_setpoints_valid =
+            id(heating_setpoint_normal_direct).has_state() &&
+            id(heating_setpoint_reduced_direct).has_state() &&
+            !isnan(current_normal) && !isnan(current_reduced) &&
+            current_normal >= ${optimizer_heating_setpoint_min} &&
+            current_normal <= ${optimizer_heating_setpoint_max} &&
+            current_reduced >= ${optimizer_heating_setpoint_min} &&
+            current_reduced <= ${optimizer_heating_setpoint_max};
+          if (current_setpoints_valid) {
             id(baseline_heating_setpoint_normal) = current_normal;
             id(baseline_heating_setpoint_reduced) = current_reduced;
             id(setpoint_baseline_valid) = true;
@@ -575,7 +625,7 @@ button:
             ESP_LOGI("optimizer", "Heating setpoint baselines set to normal=%.0f reduced=%.0f",
                      current_normal, current_reduced);
           } else {
-            ESP_LOGW("optimizer", "Cannot set heating setpoint baselines: normal/reduced state unavailable.");
+            ESP_LOGW("optimizer", "Cannot set heating setpoint baselines: normal/reduced state unavailable or outside optimizer range.");
           }
 
           if (!captured_any) {
@@ -673,6 +723,7 @@ sensor:
     accuracy_decimals: 0
     update_interval: 30s
     lambda: |-
+      if (!id(heating_setpoint_normal_direct).has_state()) return NAN;
       const float v = id(heating_setpoint_normal_direct).state;
       if (isnan(v)) return NAN;
       return v;
@@ -685,6 +736,7 @@ sensor:
     accuracy_decimals: 0
     update_interval: 30s
     lambda: |-
+      if (!id(heating_setpoint_reduced_direct).has_state()) return NAN;
       const float v = id(heating_setpoint_reduced_direct).state;
       if (isnan(v)) return NAN;
       return v;
@@ -916,7 +968,15 @@ interval:
           if (!id(setpoint_baseline_valid)) {
             const float cur_normal = id(heating_setpoint_normal_direct).state;
             const float cur_reduced = id(heating_setpoint_reduced_direct).state;
-            if (!isnan(cur_normal) && !isnan(cur_reduced)) {
+            const bool current_setpoints_valid =
+              id(heating_setpoint_normal_direct).has_state() &&
+              id(heating_setpoint_reduced_direct).has_state() &&
+              !isnan(cur_normal) && !isnan(cur_reduced) &&
+              cur_normal >= ${optimizer_heating_setpoint_min} &&
+              cur_normal <= ${optimizer_heating_setpoint_max} &&
+              cur_reduced >= ${optimizer_heating_setpoint_min} &&
+              cur_reduced <= ${optimizer_heating_setpoint_max};
+            if (current_setpoints_valid) {
               id(baseline_heating_setpoint_normal) = cur_normal;
               id(baseline_heating_setpoint_reduced) = cur_reduced;
               id(setpoint_baseline_valid) = true;
@@ -942,7 +1002,22 @@ interval:
           if (id(setpoint_baseline_valid) && !id(boot_setpoint_baseline_enforced)) {
             const float cur_normal = id(heating_setpoint_normal_direct).state;
             const float cur_reduced = id(heating_setpoint_reduced_direct).state;
-            if (!isnan(cur_normal) && !isnan(cur_reduced)) {
+            const bool baseline_ok =
+              !isnan(id(baseline_heating_setpoint_normal)) &&
+              !isnan(id(baseline_heating_setpoint_reduced)) &&
+              id(baseline_heating_setpoint_normal) >= ${optimizer_heating_setpoint_min} &&
+              id(baseline_heating_setpoint_normal) <= ${optimizer_heating_setpoint_max} &&
+              id(baseline_heating_setpoint_reduced) >= ${optimizer_heating_setpoint_min} &&
+              id(baseline_heating_setpoint_reduced) <= ${optimizer_heating_setpoint_max};
+            const bool current_setpoints_valid =
+              id(heating_setpoint_normal_direct).has_state() &&
+              id(heating_setpoint_reduced_direct).has_state() &&
+              !isnan(cur_normal) && !isnan(cur_reduced);
+            if (!baseline_ok) {
+              id(setpoint_baseline_valid) = false;
+              ESP_LOGW("optimizer", "Boot: invalid heating setpoint baseline %.0f/%.0f; baseline enforcement disabled until valid readback is captured.",
+                       id(baseline_heating_setpoint_normal), id(baseline_heating_setpoint_reduced));
+            } else if (current_setpoints_valid) {
               id(boot_setpoint_baseline_enforced) = true;
               const float target_normal = id(baseline_heating_setpoint_normal);
               const float target_reduced = id(baseline_heating_setpoint_reduced);
@@ -991,6 +1066,13 @@ interval:
           if (deadline_base == 0) return;
 
           if ((uint32_t)(now - deadline_base) > timeout_ms) {
+            const bool baseline_ok =
+              !isnan(id(baseline_heating_setpoint_normal)) &&
+              !isnan(id(baseline_heating_setpoint_reduced)) &&
+              id(baseline_heating_setpoint_normal) >= ${optimizer_heating_setpoint_min} &&
+              id(baseline_heating_setpoint_normal) <= ${optimizer_heating_setpoint_max} &&
+              id(baseline_heating_setpoint_reduced) >= ${optimizer_heating_setpoint_min} &&
+              id(baseline_heating_setpoint_reduced) <= ${optimizer_heating_setpoint_max};
             id(watchdog_tripped) = true;
             id(restore_recovery_requested) = false;
             id(restore_recovery_requested_at_ms) = 0;
@@ -1001,9 +1083,15 @@ interval:
             const float target_reduced = id(baseline_heating_setpoint_reduced);
             id(desired_heating_setpoint_target) = target_normal;
             id(heating_setpoint_target_optimizer).publish_state(target_normal);
-            id(heating_setpoint_normal_direct).control(target_normal);
-            id(heating_setpoint_reduced_direct).control(target_reduced);
-            id(last_setpoint_apply_ms) = now;
+            if (baseline_ok) {
+              id(heating_setpoint_normal_direct).control(target_normal);
+              id(heating_setpoint_reduced_direct).control(target_reduced);
+              id(last_setpoint_apply_ms) = now;
+            } else {
+              id(setpoint_baseline_valid) = false;
+              ESP_LOGE("optimizer", "Watchdog: invalid heating setpoint baseline %.0f/%.0f; refusing to write unsafe fallback.",
+                       target_normal, target_reduced);
+            }
             id(setpoint_control_armed) = false;
             id(last_heartbeat_ms) = 0;
             id(armed_at_ms) = 0;
