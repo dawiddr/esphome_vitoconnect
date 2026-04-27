@@ -73,7 +73,6 @@ void OptolinkP300::begin() {
 }
 
 void OptolinkP300::loop() {
-  const uint32_t now = millis();
   switch (_state) {
   case RESET:
     _reset();
@@ -106,6 +105,7 @@ void OptolinkP300::loop() {
     // begin() not called
     break;
   }
+  const uint32_t now = millis();
   const bool request_in_flight = (_queue.size() > 0) && (_state == SEND_ACK || _state == RECEIVE);
   if (request_in_flight && (now - _lastMillis > 5000UL)) {
     OptolinkDP *dp = _queue.front();
