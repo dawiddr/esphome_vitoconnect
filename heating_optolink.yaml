@@ -4,15 +4,6 @@ substitutions:
 
   vitoconnect_update_interval: 60s
 
-  # Viessmann HK1 "Niveau" (parallel shift) is a signed integer in steps.
-  # Typical usable range is -13..+13 (device dependent).
-  hk1_niveau_min: "-13"
-  hk1_niveau_max: "13"
-
-  # Range exposed to Home Assistant for the optimizer curve-offset layer (fail-safe bounded).
-  hk1_niveau_offset_min: "-8"
-  hk1_niveau_offset_max: "8"
-
   # Range exposed to Home Assistant for the optimizer heating-setpoint layer.
   # Direct boiler setpoint entities retain the wider device-safe range below.
   optimizer_heating_setpoint_min: "19"
@@ -107,17 +98,6 @@ vitoconnect:
 # Globals used by the fail-safe optimizer layer
 # -----------------------------------------------------------------------------
 globals:
-  # Stored safe baseline for HK1 Niveau (persisted across reboots).
-  - id: baseline_hk1_niveau
-    type: float
-    restore_value: yes
-    initial_value: "0"
-
-  - id: baseline_valid
-    type: bool
-    restore_value: yes
-    initial_value: "false"
-
   # Stored safe baselines for HK1 heating setpoints (persisted across reboots).
   # These are restored on watchdog trip, HA/API loss, optimizer disable, and safe boot.
   - id: baseline_heating_setpoint_normal
@@ -137,7 +117,7 @@ globals:
 
   # Whether HA has explicitly armed heating-setpoint control mode.
   # This is persisted so an ESP reboot during setpoint-control mode can safely
-  # restore setpoint baselines on boot. HA turns it off when curve mode is active.
+  # restore setpoint baselines on boot.
   - id: setpoint_control_armed
     type: bool
     restore_value: yes
@@ -210,12 +190,6 @@ globals:
 # Scripts
 # -----------------------------------------------------------------------------
 script:
-  - id: apply_curve
-    mode: queued
-    then:
-      - lambda: |-
-          ESP_LOGD("optimizer", "Curve-offset control is disabled in setpoint-only actuator mode.");
-
   - id: apply_heating_setpoint
     mode: queued
     then:
@@ -389,7 +363,6 @@ script:
             id(setpoint_control_armed) = false;
             id(last_heartbeat_ms) = 0;
             id(armed_at_ms) = 0;
-            id(hk1_niveau_offset).publish_state(0);
             if (was_armed) {
               id(heating_setpoint_control_armed).publish_state(false);
             }
@@ -503,25 +476,6 @@ switch:
             - script.execute: restore_heating_setpoints_to_baseline
 
 number:
-  # Bounded curve-offset control surface for legacy/Niveau mode.
-  - platform: template
-    name: "HK1 Niveau offset (optimizer)"
-    id: hk1_niveau_offset
-    entity_category: config
-    icon: mdi:chart-bell-curve
-    min_value: ${hk1_niveau_offset_min}
-    max_value: ${hk1_niveau_offset_max}
-    step: 1
-    mode: slider
-    restore_value: no
-    optimistic: true
-    disabled_by_default: true
-    internal: true
-    set_action:
-      - lambda: |-
-          id(desired_offset) = x;
-      - script.execute: apply_curve
-
   # Bounded setpoint-control surface. The ESP writes this target to both
   # Viessmann normal and reduced heating setpoints.
   - platform: template
@@ -559,34 +513,7 @@ number:
       - script.execute: apply_heating_setpoint
 
   # --- Direct boiler writeables (disabled by default; use with care) ---------
-  - platform: vitoconnect
-    vitoconnect_id: vito
-    id: hk1_neigung_direct
-    name: "HK1 Neigung (slope) ⚠ direct"
-    entity_category: diagnostic
-    disabled_by_default: true
-    internal: true
-    address: 0x27D3
-    length: 1
-    min_value: 0.2
-    max_value: 3.5
-    step: 0.1
-    div_ratio: 10
-
-  - platform: vitoconnect
-    vitoconnect_id: vito
-    id: hk1_niveau_direct
-    name: "HK1 Niveau (shift) ⚠ direct"
-    entity_category: diagnostic
-    disabled_by_default: true
-    internal: true
-    address: 0x27D4
-    length: 1
-    min_value: ${hk1_niveau_min}
-    max_value: ${hk1_niveau_max}
-    step: 1
-    signed: true
-
+  
   # Setpoint-control mode writes both normal and reduced. HA should write only
   # "Heating setpoint target (optimizer)" during normal operation.
   - platform: vitoconnect
@@ -661,16 +588,6 @@ button:
     on_press:
       - lambda: |-
           bool captured_any = false;
-
-          const float current_niveau = id(hk1_niveau_direct).state;
-          if (!isnan(current_niveau)) {
-            id(baseline_hk1_niveau) = current_niveau;
-            id(baseline_valid) = true;
-            captured_any = true;
-            ESP_LOGI("optimizer", "Baseline HK1 Niveau set to %.0f", id(baseline_hk1_niveau));
-          } else {
-            ESP_LOGW("optimizer", "Cannot set HK1 Niveau baseline: no state yet.");
-          }
 
           const float current_normal = id(heating_setpoint_normal_direct).state;
           const float current_reduced = id(heating_setpoint_reduced_direct).state;
@@ -879,31 +796,6 @@ sensor:
 
   # --- Optimizer diagnostics -------------------------------------------------
   - platform: template
-    name: "HK1 Niveau baseline"
-    id: hk1_niveau_baseline
-    entity_category: diagnostic
-    unit_of_measurement: "step"
-    accuracy_decimals: 0
-    update_interval: 30s
-    lambda: |-
-      if (!id(baseline_valid)) return NAN;
-      return id(baseline_hk1_niveau);
-
-  - platform: template
-    name: "HK1 Niveau effective target"
-    id: hk1_niveau_effective_target
-    entity_category: diagnostic
-    unit_of_measurement: "step"
-    accuracy_decimals: 0
-    update_interval: 30s
-    lambda: |-
-      if (!id(baseline_valid)) return NAN;
-      float t = id(baseline_hk1_niveau) + id(desired_offset);
-      if (t < ${hk1_niveau_min}) t = ${hk1_niveau_min};
-      if (t > ${hk1_niveau_max}) t = ${hk1_niveau_max};
-      return t;
-
-  - platform: template
     name: "Heating setpoint baseline normal"
     id: heating_setpoint_baseline_normal_sensor
     entity_category: diagnostic
@@ -1015,22 +907,10 @@ text_sensor:
 # -----------------------------------------------------------------------------
 interval:
   # Capture baselines once (only if they have not been stored yet).
-  # Also enforce safe start after reboot. Curve and setpoint baselines are
-  # enforced independently so one missing datapoint does not block the other.
+  # Also enforce safe start after reboot.
   - interval: 10s
     then:
       - lambda: |-
-          // Curve baseline capture
-          if (!id(baseline_valid)) {
-            const float cur = id(hk1_niveau_direct).state;
-            if (!isnan(cur)) {
-              id(baseline_hk1_niveau) = cur;
-              id(baseline_valid) = true;
-              ESP_LOGI("optimizer", "Captured baseline HK1 Niveau from boiler: %.0f",
-                       id(baseline_hk1_niveau));
-            }
-          }
-
           // Heating setpoint baseline capture
           if (!id(setpoint_baseline_valid)) {
             const float cur_normal = id(heating_setpoint_normal_direct).state;
@@ -1051,17 +931,6 @@ interval:
               id(heating_setpoint_target_optimizer).publish_state(cur_normal);
               ESP_LOGI("optimizer", "Captured heating setpoint baselines: normal=%.0f reduced=%.0f",
                        cur_normal, cur_reduced);
-            }
-          }
-
-          // Curve boot enforcement (only once)
-          if (id(baseline_valid) && !id(boot_baseline_enforced)) {
-            const float cur = id(hk1_niveau_direct).state;
-            if (!isnan(cur)) {
-              id(boot_baseline_enforced) = true;
-              id(desired_offset) = 0;
-              id(hk1_niveau_offset).publish_state(0);
-              ESP_LOGI("optimizer", "Boot: curve-offset baseline write skipped in setpoint-only actuator mode.");
             }
           }
 
