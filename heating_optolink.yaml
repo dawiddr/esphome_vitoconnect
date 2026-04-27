@@ -543,6 +543,31 @@ number:
     max_value: ${heating_setpoint_direct_max}
     step: 1
 
+
+select:
+  # Commanded operating mode for Vitotronic 200 HO1B / VScotHO1, heating circuit A1/M1.
+  # 0x2301 is commonly useful for read-only/display mode; 0x2323 is the
+  # writable operating-mode datapoint for A1/M1.
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    id: operating_mode_a1m1
+    name: "Operating mode"
+    entity_category: config
+    icon: mdi:home-thermometer
+    address: 0x2323
+    length: 1
+    options:
+      - value: 0
+        label: "Off / frost protection"
+      - value: 1
+        label: "Hot water only"
+      - value: 2
+        label: "Hot water + heating"
+      - value: 3
+        label: "Continuous reduced"
+      - value: 4
+        label: "Continuous normal"
+
 button:
   - platform: template
     name: "Optimizer heartbeat"
