@@ -609,8 +609,6 @@ button:
     id: set_baseline_from_current
     entity_category: config
     icon: mdi:content-save
-    disabled_by_default: true
-    internal: true
     on_press:
       - lambda: |-
           bool captured_any = false;
