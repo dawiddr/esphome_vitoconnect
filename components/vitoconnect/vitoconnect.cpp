@@ -238,7 +238,11 @@ void VitoConnect::_onData(uint8_t* data, uint8_t len, void* arg) {
       cbArg->dp->clearVerifyPending();
       cbArg->dp->resetWriteFailCount();
     }
-  } else { // ignore read responses only while the datapoint write is in flight
+  } else { // Read responses must belong to the current observation epoch.
+    if (cbArg->read_epoch != cbArg->dp->getReadEpoch()) {
+      delete cbArg;
+      return;
+    }
     if (cbArg->dp->isWriteInFlight()) {
       ESP_LOGD(TAG, "Ignoring read response: addr=0x%04X write in-flight", cbArg->dp->getAddress());
       delete cbArg;

@@ -60,6 +60,10 @@ class Datapoint {
   void setLastUpdate(uint32_t last_update) { this->_last_update = last_update; }
   void clearLastUpdate() { this->_last_update = 0; }
 
+  // Read requests queued before a control/cancellation boundary are not new proof.
+  uint32_t getReadEpoch() const { return this->_read_epoch; }
+  void invalidateReadRequests() { if (++this->_read_epoch == 0) ++this->_read_epoch; }
+
   // --- Write state tracking -------------------------------------------------
   // `_last_update` indicates that an external caller (e.g. an ESPHome entity)
   // changed the datapoint and that it should be written back to the controller.
@@ -109,6 +113,7 @@ class Datapoint {
   }
 
  protected:
+  uint32_t _read_epoch = 0;
   uint32_t _last_update = 0;
   bool _write_in_flight = false;
   uint8_t _write_fail_count = 0;

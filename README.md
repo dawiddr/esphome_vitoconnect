@@ -1,5 +1,10 @@
 # Vitoconnect for ESPHome
 
+> Joint safety update **0.2.1**: read [SAFETY_UPGRADE.md](SAFETY_UPGRADE.md) before
+> deployment. This update interrupts unsafe verification, prevents re-arm feedback,
+> and makes unknown-baseline commissioning explicitly operator-controlled.
+> Unattended HA control still requires the actuator wire-status sensor.
+
 Integration of Viessmann Optolink protocols [GWG], KW and P300 into [ESPHome]. This component is named after the cloud reading unit of Viessmann: Vitoconnect.
 
 ## Usage
@@ -100,3 +105,8 @@ Copyright (c) 2025 Philipp Danner
 [Bert Melis]: https://github.com/bertmelis
 [Philipp Hack]: https://github.com/phha
 [GWG]: README_GWG.md
+## Optimizer safety regression checks
+
+Install `requirements-dev.txt` and provide `g++`, then run
+`python tests/host_safety_checks.py`. See `SAFETY_UPGRADE.md` for the joint checks
+and the additional target-build and physical acceptance tests.

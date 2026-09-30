@@ -15,6 +15,10 @@ OPTOLINKNumber::OPTOLINKNumber(){}
 OPTOLINKNumber::~OPTOLINKNumber() {}
 
 void OPTOLINKNumber::control(float value) {
+  if (!std::isfinite(value)) {
+    ESP_LOGW(TAG, "Ignoring non-finite number command");
+    return;
+  }
   const float min_value = this->traits.get_min_value();
   const float max_value = this->traits.get_max_value();
 
@@ -49,7 +53,12 @@ void OPTOLINKNumber::control(float value) {
 
   this->_command_value = value;
   this->_has_command_value = true;
-  this->_last_update = millis();
+  // millis() is not a transaction identity: superseding commands may arrive in
+  // the same tick (or at tick zero). Never reuse an active command's identity.
+  if (++this->_command_sequence == 0) ++this->_command_sequence;
+  this->_last_update = this->_command_sequence;
+  this->clearVerifyPending();
+  this->resetWriteFailCount();
 }
 
 void OPTOLINKNumber::decode(uint8_t* data, uint8_t length, Datapoint* dp) {
@@ -104,6 +113,8 @@ void OPTOLINKNumber::decode(uint8_t* data, uint8_t length, Datapoint* dp) {
     this->_has_command_value = false;
   }
   this->_last_read_ms = millis();
+  if (++this->_read_sequence == 0) ++this->_read_sequence;
+  this->_read_expired = false;
   publish_state(value);
 }
 

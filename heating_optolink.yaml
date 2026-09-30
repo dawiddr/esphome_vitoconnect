@@ -19,6 +19,10 @@ substitutions:
   # Internal rate limit for writes to the boiler (milliseconds).
   optimizer_min_write_interval_ms: "120000"  # 2 minutes
   optimizer_restore_debounce_ms: "5000"
+  # Wire truth expires independently of the HA API connection.
+  optimizer_readback_max_age_ms: "180000"
+  optimizer_readback_pair_max_skew_ms: "15000"
+  optimizer_restore_retry_ms: "120000"
 
 esphome:
   name: ${name}
@@ -32,6 +36,12 @@ esphome:
     priority: -100
     then:
       - lambda: |-
+          // Restore any known baseline on boot, even if a recent armed flag
+          // had not reached persistent storage before power was lost.
+          const bool resume_restore = id(setpoint_baseline_valid) || id(restore_required) ||
+                                      id(setpoint_control_armed) || id(watchdog_tripped);
+          id(setpoint_control_armed) = false;
+          id(heating_setpoint_control_armed).publish_state(false);
           id(desired_offset) = 0;
           id(last_heartbeat_ms) = 0;
           id(armed_at_ms) = 0;
@@ -53,8 +63,11 @@ esphome:
             ESP_LOGW("optimizer", "Discarding invalid persisted heating setpoint baseline %.0f/%.0f; refusing setpoint writes until a valid readback is captured.",
                      normal, reduced);
             id(setpoint_baseline_valid) = false;
-            id(baseline_heating_setpoint_normal) = ${heating_setpoint_default_baseline};
-            id(baseline_heating_setpoint_reduced) = ${heating_setpoint_default_baseline};
+            // Retain the old values for diagnosis; they are not writable authority.
+          }
+          id(commissioning_required) = !id(setpoint_baseline_valid);
+          if (resume_restore || id(commissioning_required)) {
+            id(restore_heating_setpoints_to_baseline).execute();
           }
 
 esp32:
@@ -65,7 +78,7 @@ esp32:
 
 # Use the write-enabled vitoconnect fork shipped in this artifact ZIP.
 # Folder layout (relative to this YAML):
-#   ./external_components/esphome_vitoconnect/components/vitoconnect/...
+#   ./components/vitoconnect/...
 external_components:
   - source:
       type: local
@@ -99,6 +112,26 @@ vitoconnect:
 # Globals used by the fail-safe optimizer layer
 # -----------------------------------------------------------------------------
 globals:
+  # No trusted fallback exists in this state. Only explicit operator capture
+  # may commission it; ordinary restore requests never trust current outputs.
+  - id: commissioning_required
+    type: bool
+    restore_value: yes
+    initial_value: "true"
+  # An outstanding safety obligation survives disarm, transport retry exhaustion,
+  # HA loss and reboot. Only fresh, matching readbacks may clear it.
+  - id: restore_required
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+  - id: restore_normal_sequence
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: restore_reduced_sequence
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
   # Stored safe baselines for HK1 heating setpoints (persisted across reboots).
   # These are restored on watchdog trip, HA/API loss, optimizer disable, and safe boot.
   - id: baseline_heating_setpoint_normal
@@ -199,8 +232,10 @@ script:
             ESP_LOGW("optimizer", "Heating setpoint baseline not known yet; skipping setpoint apply.");
             return;
           }
-          if (id(watchdog_tripped)) {
-            ESP_LOGW("optimizer", "Watchdog is tripped; skipping setpoint apply.");
+          if (id(watchdog_tripped) || id(restore_required) ||
+              !id(heating_setpoint_normal_direct).readIsFresh(${optimizer_readback_max_age_ms}) ||
+              !id(heating_setpoint_reduced_direct).readIsFresh(${optimizer_readback_max_age_ms})) {
+            ESP_LOGW("optimizer", "No current control permission or wire truth; skipping setpoint apply.");
             return;
           }
           if (!id(setpoint_control_armed)) {
@@ -264,136 +299,81 @@ script:
     mode: restart
     then:
       - lambda: |-
-          const bool baseline_ok =
-            id(setpoint_baseline_valid) &&
-            !isnan(id(baseline_heating_setpoint_normal)) &&
-            !isnan(id(baseline_heating_setpoint_reduced)) &&
-            id(baseline_heating_setpoint_normal) >= ${optimizer_heating_setpoint_min} &&
-            id(baseline_heating_setpoint_normal) <= ${optimizer_heating_setpoint_max} &&
-            id(baseline_heating_setpoint_reduced) >= ${optimizer_heating_setpoint_min} &&
-            id(baseline_heating_setpoint_reduced) <= ${optimizer_heating_setpoint_max};
-          if (baseline_ok) {
-            const uint32_t now = millis();
-            const float target_normal = id(baseline_heating_setpoint_normal);
-            const float target_reduced = id(baseline_heating_setpoint_reduced);
-            id(desired_heating_setpoint_target) = target_normal;
-            id(heating_setpoint_target_optimizer).publish_state(target_normal);
-
-            const float cur_normal = id(heating_setpoint_normal_direct).state;
-            const float cur_reduced = id(heating_setpoint_reduced_direct).state;
-            const bool normal_ok = !isnan(cur_normal) && fabsf(cur_normal - target_normal) < 0.01f;
-            const bool reduced_ok = !isnan(cur_reduced) && fabsf(cur_reduced - target_reduced) < 0.01f;
-            const bool normal_pending_matches =
-              id(heating_setpoint_normal_direct).hasPendingCommand() &&
-              fabsf(id(heating_setpoint_normal_direct).getPendingCommandValue() - target_normal) < 0.01f;
-            const bool reduced_pending_matches =
-              id(heating_setpoint_reduced_direct).hasPendingCommand() &&
-              fabsf(id(heating_setpoint_reduced_direct).getPendingCommandValue() - target_reduced) < 0.01f;
-            const bool pending_mismatch =
-              (id(heating_setpoint_normal_direct).hasPendingCommand() && !normal_pending_matches) ||
-              (id(heating_setpoint_reduced_direct).hasPendingCommand() && !reduced_pending_matches);
-            const bool recently_requested =
-              id(last_restore_attempt_ms) != 0 &&
-              (uint32_t)(now - id(last_restore_attempt_ms)) < (uint32_t) ${optimizer_min_write_interval_ms};
-            if (recently_requested && ((normal_ok && reduced_ok) || (normal_pending_matches && reduced_pending_matches))) {
-              ESP_LOGD("optimizer", "Heating setpoint restore already requested recently; skipping duplicate restore.");
-              return;
-            }
-            if (normal_ok && reduced_ok && !pending_mismatch) {
-              ESP_LOGD("optimizer", "Heating setpoints already read back at baseline %.0f/%.0f; no restore write needed.",
-                       target_normal, target_reduced);
-              id(last_restore_attempt_ms) = now;
-              return;
-            } else {
-              ESP_LOGI("optimizer", "Restoring heating setpoints to baseline normal=%.0f reduced=%.0f",
-                       target_normal, target_reduced);
-            }
-            id(heating_setpoint_normal_direct).control(target_normal);
-            id(heating_setpoint_reduced_direct).control(target_reduced);
-            id(last_setpoint_apply_ms) = now;
-            id(last_restore_attempt_ms) = now;
-          } else {
+          // Stopped control and baseline intent are established BEFORE any no-op decision.
+          const uint32_t now = millis();
+          id(setpoint_control_armed) = false;
+          id(heating_setpoint_control_armed).publish_state(false);
+          id(last_heartbeat_ms) = 0;
+          id(armed_at_ms) = 0;
+          id(desired_offset) = 0;
+          const float normal = id(baseline_heating_setpoint_normal);
+          const float reduced = id(baseline_heating_setpoint_reduced);
+          if (!id(setpoint_baseline_valid) || !std::isfinite(normal) || !std::isfinite(reduced) ||
+              normal < ${optimizer_heating_setpoint_min} || normal > ${optimizer_heating_setpoint_max} ||
+              reduced < ${optimizer_heating_setpoint_min} || reduced > ${optimizer_heating_setpoint_max}) {
+            // An unknown destination is NOT a known-baseline restore obligation.
+            // Stop unsent work; an in-flight command remains visible until it ends.
             id(setpoint_baseline_valid) = false;
-            ESP_LOGW("optimizer", "Heating setpoint baseline not known yet; cannot restore setpoints.");
+            id(commissioning_required) = true;
+            id(restore_required) = false;
+            id(heating_setpoint_normal_direct).cancelPendingCommand();
+            id(heating_setpoint_reduced_direct).cancelPendingCommand();
+            ESP_LOGE("optimizer", "No trusted baseline: disarmed, operator commissioning required; no fallback value written.");
+            return;
+          }
+          id(commissioning_required) = false;
+          if (!id(restore_required)) {
+            id(restore_required) = true;
+            id(restore_normal_sequence) = id(heating_setpoint_normal_direct).getReadSequence();
+            id(restore_reduced_sequence) = id(heating_setpoint_reduced_direct).getReadSequence();
+            id(last_restore_attempt_ms) = 0;
+          }
+          id(desired_heating_setpoint_target) = normal;
+          id(heating_setpoint_target_optimizer).publish_state(normal);
+          auto &n = *id(heating_setpoint_normal_direct);
+          auto &r = *id(heating_setpoint_reduced_direct);
+          const bool normal_ok = n.has_state() && fabsf(n.state - normal) < 0.01f;
+          const bool reduced_ok = r.has_state() && fabsf(r.state - reduced) < 0.01f;
+          const bool fresh = n.readIsFresh(${optimizer_readback_max_age_ms}) &&
+                             r.readIsFresh(${optimizer_readback_max_age_ms});
+          const bool advanced = n.getReadSequence() != id(restore_normal_sequence) &&
+                                r.getReadSequence() != id(restore_reduced_sequence);
+          if (fresh && advanced && normal_ok && reduced_ok && !n.hasPendingCommand() && !r.hasPendingCommand()) {
+            id(restore_required) = false;
+            id(watchdog_tripped) = false;
+            id(restore_recovery_requested) = false;
+            id(restore_recovery_requested_at_ms) = 0;
+            ESP_LOGI("optimizer", "Baseline restore freshly verified: %.0f/%.0f; control remains disarmed.", normal, reduced);
+            return;
+          }
+          // A transport budget ends one attempt, not this obligation. Never reset an
+          // active matching attempt; do replace a conflicting one, including in-flight.
+          const bool retry_due = id(last_restore_attempt_ms) == 0 ||
+            (uint32_t)(now - id(last_restore_attempt_ms)) >= ${optimizer_restore_retry_ms};
+          bool submitted = false;
+          auto reconcile = [&](auto &dp, float target, bool actual_ok) {
+            const bool pending = dp.hasPendingCommand();
+            const bool conflict = pending && fabsf(dp.getPendingCommandValue() - target) >= 0.01f;
+            const bool idle = dp.getLastUpdate() == 0 && !dp.hasActiveWriteCommand();
+            if (conflict || (retry_due && idle && (pending || !actual_ok))) {
+              dp.control(target);
+              submitted = true;
+            }
+          };
+          reconcile(n, normal, normal_ok);
+          reconcile(r, reduced, reduced_ok);
+          if (submitted) {
+            id(last_restore_attempt_ms) = now == 0 ? 1 : now;
+            id(last_setpoint_apply_ms) = now;
           }
 
   - id: revert_to_baseline
     mode: restart
     then:
       - lambda: |-
-          const uint32_t now = millis();
-          const bool was_armed = id(setpoint_control_armed);
-          const bool baseline_ok =
-            id(setpoint_baseline_valid) &&
-            !isnan(id(baseline_heating_setpoint_normal)) &&
-            !isnan(id(baseline_heating_setpoint_reduced)) &&
-            id(baseline_heating_setpoint_normal) >= ${optimizer_heating_setpoint_min} &&
-            id(baseline_heating_setpoint_normal) <= ${optimizer_heating_setpoint_max} &&
-            id(baseline_heating_setpoint_reduced) >= ${optimizer_heating_setpoint_min} &&
-            id(baseline_heating_setpoint_reduced) <= ${optimizer_heating_setpoint_max};
-          if (baseline_ok) {
-            const float target_normal = id(baseline_heating_setpoint_normal);
-            const float target_reduced = id(baseline_heating_setpoint_reduced);
-
-            const float cur_normal = id(heating_setpoint_normal_direct).state;
-            const float cur_reduced = id(heating_setpoint_reduced_direct).state;
-            const bool normal_ok = !isnan(cur_normal) && fabsf(cur_normal - target_normal) < 0.01f;
-            const bool reduced_ok = !isnan(cur_reduced) && fabsf(cur_reduced - target_reduced) < 0.01f;
-            const bool normal_pending_matches =
-              id(heating_setpoint_normal_direct).hasPendingCommand() &&
-              fabsf(id(heating_setpoint_normal_direct).getPendingCommandValue() - target_normal) < 0.01f;
-            const bool reduced_pending_matches =
-              id(heating_setpoint_reduced_direct).hasPendingCommand() &&
-              fabsf(id(heating_setpoint_reduced_direct).getPendingCommandValue() - target_reduced) < 0.01f;
-            const bool recently_requested =
-              id(last_restore_attempt_ms) != 0 &&
-              (uint32_t)(now - id(last_restore_attempt_ms)) < (uint32_t) ${optimizer_min_write_interval_ms};
-            if (recently_requested && ((normal_ok && reduced_ok) || (normal_pending_matches && reduced_pending_matches))) {
-              ESP_LOGD("optimizer", "Baseline restore already requested recently; skipping duplicate revert.");
-              return;
-            }
-
-            id(desired_offset) = 0;
-            if (id(watchdog_tripped)) {
-              id(restore_recovery_requested) = true;
-              id(restore_recovery_requested_at_ms) = now;
-            } else {
-              id(restore_recovery_requested) = false;
-              id(restore_recovery_requested_at_ms) = 0;
-            }
-            id(setpoint_control_armed) = false;
-            id(last_heartbeat_ms) = 0;
-            id(armed_at_ms) = 0;
-            if (was_armed) {
-              id(heating_setpoint_control_armed).publish_state(false);
-            }
-            id(desired_heating_setpoint_target) = target_normal;
-            id(heating_setpoint_target_optimizer).publish_state(target_normal);
-
-            const bool pending_mismatch =
-              (id(heating_setpoint_normal_direct).hasPendingCommand() && !normal_pending_matches) ||
-              (id(heating_setpoint_reduced_direct).hasPendingCommand() && !reduced_pending_matches);
-            if (normal_ok && reduced_ok && !pending_mismatch) {
-              ESP_LOGD("optimizer", "Heating setpoints already read back at baseline %.0f/%.0f; no revert write needed.",
-                       target_normal, target_reduced);
-              id(last_restore_attempt_ms) = now;
-              return;
-            } else {
-              ESP_LOGI("optimizer", "Reverting heating setpoints to baseline normal=%.0f reduced=%.0f",
-                       target_normal, target_reduced);
-            }
-            id(heating_setpoint_normal_direct).control(target_normal);
-            id(heating_setpoint_reduced_direct).control(target_reduced);
-            id(last_setpoint_apply_ms) = now;
-            id(last_restore_attempt_ms) = now;
-          } else {
-            id(setpoint_baseline_valid) = false;
-            id(setpoint_control_armed) = false;
-            id(last_heartbeat_ms) = 0;
-            id(armed_at_ms) = 0;
-            id(heating_setpoint_control_armed).publish_state(false);
-            ESP_LOGW("optimizer", "Heating setpoint baseline not known yet; cannot revert setpoints.");
-          }
+          // The restore script is idempotent only for the current active obligation.
+          // In particular, a recent *completed* restore never suppresses a new one.
+          id(restore_heating_setpoints_to_baseline).execute();
 
 # -----------------------------------------------------------------------------
 # Fail-safe optimizer interface for Home Assistant
@@ -427,54 +407,42 @@ switch:
       return id(setpoint_control_armed);
     turn_on_action:
       - lambda: |-
-          if (!id(setpoint_baseline_valid)) {
-            id(setpoint_control_armed) = false;
-            id(heating_setpoint_control_armed).publish_state(false);
-            ESP_LOGW("optimizer", "Heating setpoint control arm requested but no setpoint baseline is known; refusing to arm.");
+          // An idempotent turn_on must neither extend the lease nor abandon a
+          // currently owned write. Faulted ownership instead requests restore.
+          if (id(setpoint_control_armed)) {
+            if (id(restore_required) || id(watchdog_tripped)) {
+              id(restore_heating_setpoints_to_baseline).execute();
+            }
             return;
           }
-          const float baseline = id(baseline_heating_setpoint_normal);
-          const float baseline_reduced = id(baseline_heating_setpoint_reduced);
-          if (isnan(baseline) || isnan(baseline_reduced) ||
-              baseline < ${optimizer_heating_setpoint_min} || baseline > ${optimizer_heating_setpoint_max} ||
-              baseline_reduced < ${optimizer_heating_setpoint_min} || baseline_reduced > ${optimizer_heating_setpoint_max}) {
-            id(setpoint_baseline_valid) = false;
+          const float normal = id(baseline_heating_setpoint_normal);
+          const float reduced = id(baseline_heating_setpoint_reduced);
+          auto &n = *id(heating_setpoint_normal_direct);
+          auto &r = *id(heating_setpoint_reduced_direct);
+          const bool safe = id(setpoint_baseline_valid) && !id(restore_required) && !id(watchdog_tripped) &&
+            std::isfinite(normal) && std::isfinite(reduced) &&
+            normal >= ${optimizer_heating_setpoint_min} && normal <= ${optimizer_heating_setpoint_max} &&
+            reduced >= ${optimizer_heating_setpoint_min} && reduced <= ${optimizer_heating_setpoint_max} &&
+            n.readIsFresh(${optimizer_readback_max_age_ms}) && r.readIsFresh(${optimizer_readback_max_age_ms}) &&
+            !n.hasPendingCommand() && !r.hasPendingCommand() &&
+            fabsf(n.state - normal) < 0.01f && fabsf(r.state - reduced) < 0.01f;
+          if (!safe) {
             id(setpoint_control_armed) = false;
             id(heating_setpoint_control_armed).publish_state(false);
-            ESP_LOGW("optimizer", "Heating setpoint control arm requested with invalid baseline %.0f/%.0f; refusing to arm.",
-                     baseline, baseline_reduced);
+            ESP_LOGW("optimizer", "Refusing arm until baseline is freshly verified and restoration is complete.");
+            if (id(setpoint_baseline_valid) || n.hasPendingCommand() || r.hasPendingCommand()) {
+              id(restore_heating_setpoints_to_baseline).execute();
+            }
             return;
           }
-          if (id(watchdog_tripped)) {
-            id(setpoint_control_armed) = false;
-            id(heating_setpoint_control_armed).publish_state(false);
-            ESP_LOGW("optimizer", "Heating setpoint control arm requested while watchdog is tripped; refusing to arm until restore verifies baseline.");
-            return;
-          }
-
-          // Avoid applying a stale target that may have been written while setpoint
-          // control was disarmed. Arming always starts from the captured safe baseline;
-          // HA may write a new optimizer target after the mode transition is complete.
-          id(desired_heating_setpoint_target) = baseline;
-          id(heating_setpoint_target_optimizer).publish_state(baseline);
-
+          id(desired_heating_setpoint_target) = normal;
+          id(heating_setpoint_target_optimizer).publish_state(normal);
           id(setpoint_control_armed) = true;
           id(armed_at_ms) = millis();
           id(last_heartbeat_ms) = 0;
-          ESP_LOGI("optimizer", "Heating setpoint control armed by HA; staged baseline target %.0fC.", baseline);
-      - script.execute: apply_heating_setpoint
+          id(heating_setpoint_control_armed).publish_state(true);
     turn_off_action:
-      - if:
-          condition:
-            lambda: |-
-              return id(setpoint_control_armed);
-          then:
-            - lambda: |-
-                id(setpoint_control_armed) = false;
-                id(last_heartbeat_ms) = 0;
-                id(armed_at_ms) = 0;
-                ESP_LOGI("optimizer", "Heating setpoint control disarmed; restoring heating setpoint baselines.");
-            - script.execute: restore_heating_setpoints_to_baseline
+      - script.execute: revert_to_baseline
 
 number:
   # Bounded setpoint-control surface. The ESP writes this target to both
@@ -489,7 +457,7 @@ number:
     step: 1
     mode: slider
     restore_value: no
-    optimistic: true
+    optimistic: false
     set_action:
       - lambda: |-
           if (!id(setpoint_control_armed)) {
@@ -501,7 +469,7 @@ number:
             ESP_LOGW("optimizer", "Ignoring setpoint target %.0f while setpoint control is not armed; safe target remains %.0f.", x, safe_target);
             return;
           }
-          if (id(watchdog_tripped)) {
+          if (id(watchdog_tripped) || id(restore_required)) {
             const float safe_target = id(setpoint_baseline_valid)
               ? id(baseline_heating_setpoint_normal)
               : (float) ${heating_setpoint_default_baseline};
@@ -510,7 +478,11 @@ number:
             ESP_LOGW("optimizer", "Ignoring setpoint target %.0f while watchdog is tripped; safe target remains %.0f.", x, safe_target);
             return;
           }
-          id(desired_heating_setpoint_target) = x;
+          if (!std::isfinite(x) || !id(setpoint_baseline_valid)) return;
+          const float accepted = roundf(std::min(std::max(x, (float) ${optimizer_heating_setpoint_min}),
+                                                (float) ${optimizer_heating_setpoint_max}));
+          id(desired_heating_setpoint_target) = accepted;
+          id(heating_setpoint_target_optimizer).publish_state(accepted);
       - script.execute: apply_heating_setpoint
 
   # --- Direct boiler writeables (disabled by default; use with care) ---------
@@ -580,7 +552,9 @@ button:
             ESP_LOGW("optimizer", "Ignoring optimizer heartbeat while setpoint control is not armed.");
             return;
           }
-          if (id(watchdog_tripped)) {
+          if (id(watchdog_tripped) || id(restore_required) ||
+              !id(heating_setpoint_normal_direct).readIsFresh(${optimizer_readback_max_age_ms}) ||
+              !id(heating_setpoint_reduced_direct).readIsFresh(${optimizer_readback_max_age_ms})) {
             ESP_LOGW("optimizer", "Ignoring optimizer heartbeat while watchdog is tripped; use restore-baseline recovery.");
             return;
           }
@@ -592,17 +566,7 @@ button:
     entity_category: config
     icon: mdi:backup-restore
     on_press:
-      - if:
-          condition:
-            lambda: |-
-              return !id(setpoint_control_armed) &&
-                     id(last_restore_attempt_ms) != 0 &&
-                     (uint32_t)(millis() - id(last_restore_attempt_ms)) < (uint32_t) ${optimizer_min_write_interval_ms};
-          then:
-            - lambda: |-
-                ESP_LOGD("optimizer", "Baseline restore already in progress; ignoring duplicate restore button press.");
-          else:
-            - script.execute: revert_to_baseline
+      - script.execute: revert_to_baseline
 
   - platform: template
     name: "Set optimizer baselines from current boiler"
@@ -611,35 +575,34 @@ button:
     icon: mdi:content-save
     on_press:
       - lambda: |-
-          bool captured_any = false;
-
-          const float current_normal = id(heating_setpoint_normal_direct).state;
-          const float current_reduced = id(heating_setpoint_reduced_direct).state;
-          const bool current_setpoints_valid =
-            id(heating_setpoint_normal_direct).has_state() &&
-            id(heating_setpoint_reduced_direct).has_state() &&
-            !isnan(current_normal) && !isnan(current_reduced) &&
-            current_normal >= ${optimizer_heating_setpoint_min} &&
-            current_normal <= ${optimizer_heating_setpoint_max} &&
-            current_reduced >= ${optimizer_heating_setpoint_min} &&
-            current_reduced <= ${optimizer_heating_setpoint_max};
-          if (current_setpoints_valid) {
-            id(baseline_heating_setpoint_normal) = current_normal;
-            id(baseline_heating_setpoint_reduced) = current_reduced;
-            id(setpoint_baseline_valid) = true;
-            id(desired_heating_setpoint_target) = current_normal;
-            id(heating_setpoint_target_optimizer).publish_state(current_normal);
-            captured_any = true;
-            ESP_LOGI("optimizer", "Heating setpoint baselines set to normal=%.0f reduced=%.0f",
-                     current_normal, current_reduced);
-          } else {
-            ESP_LOGW("optimizer", "Cannot set heating setpoint baselines: normal/reduced state unavailable or outside optimizer range.");
+          auto &n = *id(heating_setpoint_normal_direct);
+          auto &r = *id(heating_setpoint_reduced_direct);
+          const uint32_t now = millis();
+          const uint32_t n_age = now - n.getLastReadMs();
+          const uint32_t r_age = now - r.getLastReadMs();
+          const uint32_t skew = n_age > r_age ? n_age - r_age : r_age - n_age;
+          const bool commissioning = id(commissioning_required) && !id(setpoint_baseline_valid);
+          if (id(setpoint_control_armed) || id(restore_required) || (id(watchdog_tripped) && !commissioning) ||
+              n.hasPendingCommand() || r.hasPendingCommand() ||
+              !n.readIsFresh(${optimizer_readback_max_age_ms}) || !r.readIsFresh(${optimizer_readback_max_age_ms}) ||
+              skew > ${optimizer_readback_pair_max_skew_ms} ||
+              !std::isfinite(n.state) || !std::isfinite(r.state) ||
+              n.state < ${optimizer_heating_setpoint_min} || n.state > ${optimizer_heating_setpoint_max} ||
+              r.state < ${optimizer_heating_setpoint_min} || r.state > ${optimizer_heating_setpoint_max}) {
+            ESP_LOGW("optimizer", "Baseline capture refused: require idle, disarmed control and a fresh coherent pair.");
+            return;
           }
-
-          if (!captured_any) {
-            ESP_LOGW("optimizer", "No optimizer baselines were captured from current boiler state.");
-          }
-      - script.execute: revert_to_baseline
+          id(baseline_heating_setpoint_normal) = n.state;
+          id(baseline_heating_setpoint_reduced) = r.state;
+          id(setpoint_baseline_valid) = true;
+          id(commissioning_required) = false;
+          // The operator has deliberately established a new trusted fallback.
+          // This does not arm control or acknowledge any former optimized write.
+          id(watchdog_tripped) = false;
+          id(restore_recovery_requested) = false;
+          id(desired_heating_setpoint_target) = n.state;
+          id(heating_setpoint_target_optimizer).publish_state(n.state);
+          ESP_LOGI("optimizer", "Captured trusted baseline %.0f/%.0f.", n.state, r.state);
 
 # -----------------------------------------------------------------------------
 # Sensors (original + optimizer diagnostics)
@@ -731,7 +694,7 @@ sensor:
     accuracy_decimals: 0
     update_interval: 30s
     lambda: |-
-      if (!id(heating_setpoint_normal_direct).has_state()) return NAN;
+      if (!id(heating_setpoint_normal_direct).readIsFresh(${optimizer_readback_max_age_ms})) return NAN;
       const float v = id(heating_setpoint_normal_direct).state;
       if (isnan(v)) return NAN;
       return v;
@@ -744,7 +707,7 @@ sensor:
     accuracy_decimals: 0
     update_interval: 30s
     lambda: |-
-      if (!id(heating_setpoint_reduced_direct).has_state()) return NAN;
+      if (!id(heating_setpoint_reduced_direct).readIsFresh(${optimizer_readback_max_age_ms})) return NAN;
       const float v = id(heating_setpoint_reduced_direct).state;
       if (isnan(v)) return NAN;
       return v;
@@ -871,6 +834,23 @@ sensor:
       return (uint32_t)(millis() - id(last_heartbeat_ms)) / 1000.0f;
 
 binary_sensor:
+  - platform: template
+    name: "Optimizer commissioning required"
+    entity_category: diagnostic
+    device_class: problem
+    lambda: "return id(commissioning_required) || !id(setpoint_baseline_valid);"
+
+  - platform: template
+    name: "Optimizer boiler link healthy"
+    entity_category: diagnostic
+    lambda: |-
+      return id(heating_setpoint_normal_direct).readIsFresh(${optimizer_readback_max_age_ms}) &&
+             id(heating_setpoint_reduced_direct).readIsFresh(${optimizer_readback_max_age_ms});
+  - platform: template
+    name: "Optimizer baseline restore required"
+    entity_category: diagnostic
+    lambda: "return id(restore_required);"
+
   - platform: vitoconnect
     vitoconnect_id: vito
     name: "Heating circuit pump active"
@@ -913,6 +893,30 @@ binary_sensor:
       return id(watchdog_tripped);
 
 text_sensor:
+  # Contract v1 consumed by HA's actuator_status_entity selector (under 255 bytes).
+  - platform: template
+    id: optimizer_actuator_status
+    name: "Optimizer actuator status"
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: |-
+      auto &n = *id(heating_setpoint_normal_direct);
+      auto &r = *id(heating_setpoint_reduced_direct);
+      const uint32_t now = millis();
+      const uint32_t na = n.getReadSequence() ? now - n.getLastReadMs() : UINT32_MAX;
+      const uint32_t ra = r.getReadSequence() ? now - r.getLastReadMs() : UINT32_MAX;
+      const bool healthy = n.readIsFresh(${optimizer_readback_max_age_ms}) && r.readIsFresh(${optimizer_readback_max_age_ms});
+      const bool pending = n.hasPendingCommand() || r.hasPendingCommand() ||
+        (id(setpoint_control_armed) && (fabsf(n.state - id(desired_heating_setpoint_target)) >= 0.01f ||
+                                      fabsf(r.state - id(desired_heating_setpoint_target)) >= 0.01f));
+      char status[256];
+      snprintf(status, sizeof(status),
+        "{\"v\":1,\"n\":%.2f,\"r\":%.2f,\"na\":%u,\"ra\":%u,\"ns\":%u,\"rs\":%u,\"p\":%s,\"restore\":%s,\"healthy\":%s}",
+        std::isfinite(n.state) ? n.state : 0.0f, std::isfinite(r.state) ? r.state : 0.0f,
+        (unsigned) na, (unsigned) ra, (unsigned) n.getReadSequence(), (unsigned) r.getReadSequence(),
+        pending ? "true" : "false", id(restore_required) ? "true" : "false", healthy ? "true" : "false");
+      return std::string(status);
+
   - platform: template
     name: "Device ID"
     entity_category: diagnostic
@@ -930,173 +934,43 @@ text_sensor:
 # Watchdog + baseline capture / boot enforcement
 # -----------------------------------------------------------------------------
 interval:
-  # Capture baselines once (only if they have not been stored yet).
-  # Also enforce safe start after reboot.
-  - interval: 10s
-    then:
-      - lambda: |-
-          // Heating setpoint baseline capture
-          if (!id(setpoint_baseline_valid)) {
-            const float cur_normal = id(heating_setpoint_normal_direct).state;
-            const float cur_reduced = id(heating_setpoint_reduced_direct).state;
-            const bool current_setpoints_valid =
-              id(heating_setpoint_normal_direct).has_state() &&
-              id(heating_setpoint_reduced_direct).has_state() &&
-              !isnan(cur_normal) && !isnan(cur_reduced) &&
-              cur_normal >= ${optimizer_heating_setpoint_min} &&
-              cur_normal <= ${optimizer_heating_setpoint_max} &&
-              cur_reduced >= ${optimizer_heating_setpoint_min} &&
-              cur_reduced <= ${optimizer_heating_setpoint_max};
-            if (current_setpoints_valid) {
-              id(baseline_heating_setpoint_normal) = cur_normal;
-              id(baseline_heating_setpoint_reduced) = cur_reduced;
-              id(setpoint_baseline_valid) = true;
-              id(desired_heating_setpoint_target) = cur_normal;
-              id(heating_setpoint_target_optimizer).publish_state(cur_normal);
-              ESP_LOGI("optimizer", "Captured heating setpoint baselines: normal=%.0f reduced=%.0f",
-                       cur_normal, cur_reduced);
-            }
-          }
+  # Baseline capture is deliberately operator-only. Healthy reads or HA startup
+  # cannot silently adopt possibly optimized values as a trusted fallback.
 
-          // Heating setpoint boot enforcement (only once)
-          if (id(setpoint_baseline_valid) && !id(boot_setpoint_baseline_enforced)) {
-            const float cur_normal = id(heating_setpoint_normal_direct).state;
-            const float cur_reduced = id(heating_setpoint_reduced_direct).state;
-            const bool baseline_ok =
-              !isnan(id(baseline_heating_setpoint_normal)) &&
-              !isnan(id(baseline_heating_setpoint_reduced)) &&
-              id(baseline_heating_setpoint_normal) >= ${optimizer_heating_setpoint_min} &&
-              id(baseline_heating_setpoint_normal) <= ${optimizer_heating_setpoint_max} &&
-              id(baseline_heating_setpoint_reduced) >= ${optimizer_heating_setpoint_min} &&
-              id(baseline_heating_setpoint_reduced) <= ${optimizer_heating_setpoint_max};
-            const bool current_setpoints_valid =
-              id(heating_setpoint_normal_direct).has_state() &&
-              id(heating_setpoint_reduced_direct).has_state() &&
-              !isnan(cur_normal) && !isnan(cur_reduced);
-            if (!baseline_ok) {
-              id(setpoint_baseline_valid) = false;
-              ESP_LOGW("optimizer", "Boot: invalid heating setpoint baseline %.0f/%.0f; baseline enforcement disabled until valid readback is captured.",
-                       id(baseline_heating_setpoint_normal), id(baseline_heating_setpoint_reduced));
-            } else if (current_setpoints_valid) {
-              id(boot_setpoint_baseline_enforced) = true;
-              const float target_normal = id(baseline_heating_setpoint_normal);
-              const float target_reduced = id(baseline_heating_setpoint_reduced);
-              id(desired_heating_setpoint_target) = target_normal;
-              id(heating_setpoint_target_optimizer).publish_state(target_normal);
-
-              if (!id(setpoint_control_armed)) {
-                ESP_LOGI("optimizer", "Boot: setpoint control not armed -> not enforcing heating setpoint baselines.");
-              } else {
-                const bool normal_ok = fabsf(cur_normal - target_normal) < 0.01f;
-                const bool reduced_ok = fabsf(cur_reduced - target_reduced) < 0.01f;
-                if (!normal_ok || !reduced_ok) {
-                  ESP_LOGI("optimizer", "Boot: setpoint control armed -> enforcing heating setpoint baselines normal=%.0f reduced=%.0f",
-                           target_normal, target_reduced);
-                  id(heating_setpoint_normal_direct).control(target_normal);
-                  id(heating_setpoint_reduced_direct).control(target_reduced);
-                  id(last_setpoint_apply_ms) = millis();
-                } else {
-                  ESP_LOGD("optimizer", "Boot: heating setpoints already at baseline %.0f/%.0f",
-                           target_normal, target_reduced);
-                }
-              }
-
-              if (id(setpoint_control_armed)) {
-                id(setpoint_control_armed) = false;
-                id(last_heartbeat_ms) = 0;
-                id(armed_at_ms) = 0;
-                id(heating_setpoint_control_armed).publish_state(false);
-                ESP_LOGI("optimizer", "Boot: setpoint control disarmed after safe baseline handling.");
-              }
-            }
-          }
-
-  # Heartbeat watchdog: revert to baselines if HA stops sending heartbeats.
-  - interval: 30s
-    then:
-      - lambda: |-
-          if (!id(setpoint_control_armed)) return;
-          if (!id(setpoint_baseline_valid)) return;
-          if (id(watchdog_tripped)) return;
-
-          const uint32_t now = millis();
-          const uint32_t timeout_ms = (uint32_t) ${optimizer_heartbeat_timeout_ms};
-          const bool has_heartbeat = id(last_heartbeat_ms) != 0;
-          const uint32_t deadline_base = has_heartbeat ? id(last_heartbeat_ms) : id(armed_at_ms);
-          if (deadline_base == 0) return;
-
-          if ((uint32_t)(now - deadline_base) > timeout_ms) {
-            const bool baseline_ok =
-              !isnan(id(baseline_heating_setpoint_normal)) &&
-              !isnan(id(baseline_heating_setpoint_reduced)) &&
-              id(baseline_heating_setpoint_normal) >= ${optimizer_heating_setpoint_min} &&
-              id(baseline_heating_setpoint_normal) <= ${optimizer_heating_setpoint_max} &&
-              id(baseline_heating_setpoint_reduced) >= ${optimizer_heating_setpoint_min} &&
-              id(baseline_heating_setpoint_reduced) <= ${optimizer_heating_setpoint_max};
-            id(watchdog_tripped) = true;
-            id(restore_recovery_requested) = baseline_ok;
-            id(restore_recovery_requested_at_ms) = baseline_ok ? now : 0;
-            ESP_LOGW("optimizer", "Watchdog: heartbeat stale (%u s) -> revert setpoint controls to baseline",
-                     (unsigned) ((now - deadline_base) / 1000));
-
-            const float target_normal = id(baseline_heating_setpoint_normal);
-            const float target_reduced = id(baseline_heating_setpoint_reduced);
-            id(desired_heating_setpoint_target) = target_normal;
-            id(heating_setpoint_target_optimizer).publish_state(target_normal);
-            if (baseline_ok) {
-              id(heating_setpoint_normal_direct).control(target_normal);
-              id(heating_setpoint_reduced_direct).control(target_reduced);
-              id(last_setpoint_apply_ms) = now;
-              id(last_restore_attempt_ms) = now;
-            } else {
-              id(setpoint_baseline_valid) = false;
-              ESP_LOGE("optimizer", "Watchdog: invalid heating setpoint baseline %.0f/%.0f; refusing to write unsafe fallback.",
-                       target_normal, target_reduced);
-            }
-            id(setpoint_control_armed) = false;
-            id(last_heartbeat_ms) = 0;
-            id(armed_at_ms) = 0;
-            id(heating_setpoint_control_armed).publish_state(false);
-          }
-
-  # Clear a latched watchdog trip only after the restore-baseline state is verified.
+  # Boiler-read freshness is independent of HA heartbeat freshness.
   - interval: 5s
     then:
       - lambda: |-
-          if (!id(watchdog_tripped)) return;
-          if (!id(restore_recovery_requested)) return;
-          if (id(setpoint_control_armed)) return;
-          if (!id(setpoint_baseline_valid)) return;
-          if (id(restore_recovery_requested_at_ms) == 0) return;
-
-          const float cur_normal = id(heating_setpoint_normal_direct).state;
-          const float cur_reduced = id(heating_setpoint_reduced_direct).state;
-          const uint32_t normal_read_ms = id(heating_setpoint_normal_direct).getLastReadMs();
-          const uint32_t reduced_read_ms = id(heating_setpoint_reduced_direct).getLastReadMs();
-          const float target_normal = id(baseline_heating_setpoint_normal);
-          const float target_reduced = id(baseline_heating_setpoint_reduced);
-          const bool normal_fresh = normal_read_ms != 0 &&
-            (uint32_t)(normal_read_ms - id(restore_recovery_requested_at_ms)) < 0x80000000UL;
-          const bool reduced_fresh = reduced_read_ms != 0 &&
-            (uint32_t)(reduced_read_ms - id(restore_recovery_requested_at_ms)) < 0x80000000UL;
-          const bool normal_ok = !isnan(cur_normal) && fabsf(cur_normal - target_normal) < 0.01f;
-          const bool reduced_ok = !isnan(cur_reduced) && fabsf(cur_reduced - target_reduced) < 0.01f;
-          if (normal_fresh && reduced_fresh && normal_ok && reduced_ok) {
-            id(watchdog_tripped) = false;
-            id(restore_recovery_requested) = false;
-            id(restore_recovery_requested_at_ms) = 0;
-            ESP_LOGI("optimizer", "Watchdog recovery verified: heating setpoints restored to baseline %.0f/%.0f and control is disarmed.",
-                     target_normal, target_reduced);
+          id(heating_setpoint_normal_direct).expireRead(${optimizer_readback_max_age_ms});
+          id(heating_setpoint_reduced_direct).expireRead(${optimizer_readback_max_age_ms});
+          if (!id(setpoint_control_armed)) return;
+          const uint32_t now = millis();
+          const uint32_t deadline_base = id(last_heartbeat_ms) != 0 ? id(last_heartbeat_ms) : id(armed_at_ms);
+          const bool stale_heartbeat = (uint32_t)(now - deadline_base) > ${optimizer_heartbeat_timeout_ms};
+          const bool stale_reads = !id(heating_setpoint_normal_direct).readIsFresh(${optimizer_readback_max_age_ms}) ||
+                                   !id(heating_setpoint_reduced_direct).readIsFresh(${optimizer_readback_max_age_ms});
+          if (stale_heartbeat || stale_reads) {
+            id(watchdog_tripped) = true;
+            id(restore_heating_setpoints_to_baseline).execute();
           }
 
-  # Reconcile pending setpoint targets. This prevents a rate-limited write from
-  # being lost while the HA-facing template number remains optimistic.
+  # Retry through outages, while disarmed and with HA absent. Matching active
+  # attempts are not restarted; idle exhausted attempts get a new bounded budget.
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            lambda: "return id(restore_required);"
+          then:
+            - script.execute: restore_heating_setpoints_to_baseline
+
   - interval: 30s
     then:
       - if:
           condition:
             lambda: |-
-              return id(setpoint_control_armed) && id(setpoint_baseline_valid) && !id(watchdog_tripped);
+              return id(setpoint_control_armed) && id(setpoint_baseline_valid) &&
+                     !id(watchdog_tripped) && !id(restore_required);
           then:
             - script.execute: apply_heating_setpoint
 

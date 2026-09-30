@@ -91,6 +91,7 @@ class VitoConnect : public uart::UARTDevice, public PollingComponent {
         dp(d),
         w(write),
         la(last_update),
+        read_epoch(d != nullptr ? d->getReadEpoch() : 0),
         exp_len(0),
         has_exp(false) {
           memset(exp, 0, sizeof(exp));
@@ -99,6 +100,7 @@ class VitoConnect : public uart::UARTDevice, public PollingComponent {
       Datapoint* dp;
       bool w;
       uint32_t la;
+      uint32_t read_epoch;
 
       // Expected raw payload for write verification (optional).
       uint8_t exp[MAX_DP_LENGTH];
