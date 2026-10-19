@@ -84,6 +84,20 @@ binary_sensor:
 Tested with OptoLink ESP32 adapter from here:
 <https://github.com/openv/openv/wiki/Bauanleitung-ESP32-Adafruit-Feather-Huzzah32-and-Proto-Wing>
 
+## Compatibility and requirements
+
+Development follows recent stable ESPHome releases. The project environment uses
+Python `>=3.12,<3.14`. [uv.lock](uv.lock) currently selects **ESPHome 2026.9.1**
+and fixes the Python dependency versions for validation. The minimum ESPHome
+constraint in [pyproject.toml](pyproject.toml) does not establish compatibility
+with every permitted release.
+
+Review the development reference before framework API changes and release
+preparation. Each new stable release does not require an immediate upgrade.
+Report the exact tested versions, board, and firmware framework with each
+validation result. See the [test guide](tests/README.md) for the review procedure
+and the limits of host tests, firmware builds, and physical checks.
+
 ## Credits
 
 Built based on [VitoWifi] by [Bert Melis] and inspired by [vitowifi_esphome] by [Philipp Hack].
@@ -105,8 +119,18 @@ Copyright (c) 2025 Philipp Danner
 [Bert Melis]: https://github.com/bertmelis
 [Philipp Hack]: https://github.com/phha
 [GWG]: README_GWG.md
-## Optimizer safety regression checks
+## Development
 
-Install `requirements-dev.txt` and provide `g++`, then run
-`python tests/host_safety_checks.py`. See `SAFETY_UPGRADE.md` for the joint checks
-and the additional target-build and physical acceptance tests.
+Install the locked environment with `uv sync --locked` and provide `g++`, then
+run `.venv/bin/python tests/host_safety_checks.py`. For changes to component ID
+handling or the host lambda renderer, also run
+`.venv/bin/python tests/check_id_reference_regression.py`.
+
+Use current, documented ESPHome APIs. Check the official documentation or the
+locked ESPHome source before an API change, and update the relevant host
+substitute to match that contract. Host checks use simulated I/O and do not
+replace ESPHome validation or a target build.
+
+See the [test guide](tests/README.md) for setup, baseline review, and firmware
+checks. [SAFETY_UPGRADE.md](SAFETY_UPGRADE.md) contains the joint checks and
+physical acceptance procedure. Its recorded results are historical evidence.
