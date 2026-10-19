@@ -619,6 +619,31 @@ sensor:
     length: 2
     internal: true
 
+  # Read-only controller identification for selecting the Optolink data address list.
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    name: "Controller hardware index"
+    address: 0x00FA
+    length: 1
+    entity_category: diagnostic
+    accuracy_decimals: 0
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    name: "Controller software index"
+    address: 0x00FB
+    length: 1
+    entity_category: diagnostic
+    accuracy_decimals: 0
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    name: "Controller variant identifier"
+    address: 0x00F0
+    length: 1
+    entity_category: diagnostic
+    accuracy_decimals: 0
+
   # Temperatures (/10)
   - platform: vitoconnect
     vitoconnect_id: vito
