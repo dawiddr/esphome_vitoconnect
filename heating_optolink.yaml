@@ -27,6 +27,7 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  min_version: 2026.8.0
   build_path: esp32
   platformio_options:
     upload_speed: 115200
@@ -973,6 +974,23 @@ interval:
                      !id(watchdog_tripped) && !id(restore_required);
           then:
             - script.execute: apply_heating_setpoint
+
+# Prefer the ETH01-EVO wired connection and keep Wi-Fi available for recovery.
+network:
+  priority:
+    - ethernet
+    - wifi
+
+ethernet:
+  type: DM9051
+  clk_pin: GPIO7
+  mosi_pin: GPIO10
+  miso_pin: GPIO3
+  cs_pin: GPIO9
+  interrupt_pin: GPIO8
+  reset_pin: GPIO6
+  # Higher SPI clock speeds can cause receive errors on this board.
+  clock_speed: 8MHz
 
 wifi:
   ssid: !secret wifi_ssid
