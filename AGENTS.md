@@ -42,7 +42,7 @@ or unavailable checks mean validation is incomplete.
 For documents only, run:
 
 ```sh
-python3 scripts/validate.py --documents-only
+.venv/bin/python scripts/validate.py --documents-only
 ```
 
 For ESPHome API, schema, C++, or YAML changes, also select affected configurations

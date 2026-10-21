@@ -122,7 +122,7 @@ Copyright (c) 2025 Philipp Danner
 
 Prepare the locked environment with `uv sync --locked` and provide `g++` with
 C++17 support, then run `.venv/bin/python scripts/validate.py`. For documents
-only, use `python3 scripts/validate.py --documents-only` without test dependencies.
+only, use `.venv/bin/python scripts/validate.py --documents-only` without test dependencies.
 
 See the [test guide](tests/README.md) for baseline review, required checks, and
 explicit schema/generation/target build selection. Build setup can download

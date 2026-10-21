@@ -135,7 +135,7 @@ validating local changes.
 Documents only need the standard-library command:
 
 ```sh
-python3 scripts/validate.py --documents-only
+.venv/bin/python scripts/validate.py --documents-only
 ```
 
 It checks required guides and local Markdown file links, excluding environments,
