@@ -53,6 +53,27 @@ ESPHome can download C++ library inputs and provision toolchains. General compon
 require a sibling optimizer checkout. Joint status and physical acceptance are
 separate stages. Report each stage and its limits; a host pass is simulated I/O.
 
+### Independent review
+
+Obtain an independent subagent review for material changes to device control,
+recovery, stored state, security, deployment boundaries, or validation correctness.
+Also use review for substantial changes across modules or interfaces. Apply this
+rule to instructions that change these behaviors. Routine low-risk changes need
+author review and existing validation.
+
+Start required reviews without further confirmation once the patch is stable
+and appropriate checks have run. Use a separate reviewer that did not author the
+patch. Give it the task, exact changes including new files, relevant instructions,
+and check results; identify unrelated existing work. Use the control rules below
+as the checklist. The reviewer must not edit, stage, or commit.
+
+Resolve confirmed material defects, run affected checks, and obtain focused
+follow-up review when needed. Style preferences do not block completion. One
+reviewer can cover a common change across projects; for contract changes, review
+both sides. Reuse completed review for a release unless later material changes
+affect the candidate. Report results and limits; report unavailable required
+review as incomplete. Review does not authorize commits or live operations.
+
 ## Code boundaries
 
 Keep protocol transport in the Optolink classes, datapoint handling in the
