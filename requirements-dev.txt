@@ -1,1 +1,2 @@
-PyYAML
+# Optional host-only setup; the supported complete environment uses uv sync --locked.
+PyYAML==6.0.3

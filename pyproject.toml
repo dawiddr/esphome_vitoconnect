@@ -5,3 +5,6 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
   "esphome>=2026.8.0"
 ]
+
+[dependency-groups]
+dev = ["PyYAML==6.0.3"]

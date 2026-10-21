@@ -7,3 +7,10 @@ __pycache__/
 .venv
 viessmann-reader.yaml
 secrets.yaml
+.private/
+.env
+.env.*
+.DS_Store
+/reports/
+/validation/
+.venv-*/

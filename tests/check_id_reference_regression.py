@@ -21,6 +21,34 @@ def invoke(root: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+
+def pointer_access_failure(result: subprocess.CompletedProcess[str]) -> bool:
+    """Accept the intended GCC or Clang member-access error, never any error."""
+    if result.returncode == 0:
+        return False
+    return bool(re.search(
+        r"error: [^\n]*(?:request for member[^\n]*which is of pointer type|"
+        r"member reference[^\n]*is a pointer; did you mean to use)", result.stderr,
+    ))
+
+
+def copy_host_inputs(root: Path, target: Path) -> None:
+    """Copy only the public source files used by the host compiler."""
+    names = [Path("heating_optolink.yaml"), Path("tests/host_safety_checks.py"),
+             Path("tests/host_stubs.py")]
+    names += [path.relative_to(root) for path in (root / "components/vitoconnect").rglob("*")
+              if path.suffix in {".h", ".cpp"} and path.is_file()
+              and not any(part.startswith(".") or part == "__pycache__"
+                          for part in path.relative_to(root).parts)]
+    for name in names:
+        source = root / name
+        if not source.is_file() or any((root / part).is_symlink()
+                                      for part in (name, *name.parents) if part != Path(".")):
+            raise RuntimeError(f"Missing or linked host input: {name}")
+        destination = target / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+
 def main() -> None:
     root = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
     original = (root / 'heating_optolink.yaml').read_text()
@@ -35,12 +63,12 @@ def main() -> None:
     for label, match in zip(labels, matches):
         with tempfile.TemporaryDirectory(prefix='vito-id-negative-') as tmp:
             copy = Path(tmp) / 'site'
-            shutil.copytree(root, copy, ignore=shutil.ignore_patterns('__pycache__', '.esphome', '.git'))
+            copy_host_inputs(root, copy)
             broken_pair = match.group().replace('= *id(', '= id(')
             mutated = original[:match.start()] + broken_pair + original[match.end():]
             (copy / 'heating_optolink.yaml').write_text(mutated)
             result = invoke(copy)
-            if result.returncode == 0 or 'which is of pointer type' not in result.stderr:
+            if not pointer_access_failure(result):
                 raise AssertionError(f'{label}: expected a pointer-access compile error\n{result.stdout}\n{result.stderr}')
         print(f'PASS: restoring the broken {label} aliases causes a compile failure', flush=True)
     result = invoke(root)

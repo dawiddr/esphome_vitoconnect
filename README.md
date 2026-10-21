@@ -1,9 +1,8 @@
 # Vitoconnect for ESPHome
 
-> Joint safety update **0.2.1**: read [SAFETY_UPGRADE.md](SAFETY_UPGRADE.md) before
-> deployment. This update interrupts unsafe verification, prevents re-arm feedback,
-> and makes unknown-baseline commissioning explicitly operator-controlled.
-> Unattended HA control still requires the actuator wire-status sensor.
+> Read [current actuator procedures](docs/ACTUATOR.md) before a site upgrade.
+> Unattended HA control requires the actuator wire-status sensor. The
+> [0.2.1 safety report](SAFETY_UPGRADE.md) contains historical implementation evidence.
 
 Integration of Viessmann Optolink protocols [GWG], KW and P300 into [ESPHome]. This component is named after the cloud reading unit of Viessmann: Vitoconnect.
 
@@ -121,16 +120,17 @@ Copyright (c) 2025 Philipp Danner
 [GWG]: README_GWG.md
 ## Development
 
-Install the locked environment with `uv sync --locked` and provide `g++`, then
-run `.venv/bin/python tests/host_safety_checks.py`. For changes to component ID
-handling or the host lambda renderer, also run
-`.venv/bin/python tests/check_id_reference_regression.py`.
+Prepare the locked environment with `uv sync --locked` and provide `g++` with
+C++17 support, then run `.venv/bin/python scripts/validate.py`. For documents
+only, use `python3 scripts/validate.py --documents-only` without test dependencies.
 
-Use current, documented ESPHome APIs. Check the official documentation or the
-locked ESPHome source before an API change, and update the relevant host
-substitute to match that contract. Host checks use simulated I/O and do not
-replace ESPHome validation or a target build.
+See the [test guide](tests/README.md) for baseline review, required checks, and
+explicit schema/generation/target build selection. Build setup can download
+firmware tools and needs an explicit opt-in. Local validation does not install
+or repair Python packages, flash devices, or establish physical compatibility.
 
-See the [test guide](tests/README.md) for setup, baseline review, and firmware
-checks. [SAFETY_UPGRADE.md](SAFETY_UPGRADE.md) contains the joint checks and
-physical acceptance procedure. Its recorded results are historical evidence.
+Use current documented ESPHome APIs and check the framework source before an API
+change. The [actuator guide](docs/ACTUATOR.md) owns commissioning and bounded
+joint status checks. The [release guide](docs/RELEASING.md) owns source identity,
+validation records, package exclusions, and output hashes. Historical safety
+reports retain their original dates and limits.

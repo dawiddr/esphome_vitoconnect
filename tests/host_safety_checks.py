@@ -9,6 +9,7 @@ in ESPHome process_lambda. Bare IDs must not be replaced with object references.
 Globals remain values. This limited renderer is not ESPHome schema/codegen validation.
 """
 from pathlib import Path
+import os
 import re
 import shutil
 import subprocess
@@ -378,9 +379,9 @@ int main() {
             'vitoconnect.cpp', 'vitoconnect_datapoint.cpp', 'vitoconnect_optolink.cpp',
             'vitoconnect_optolinkDP.cpp', 'vitoconnect_optolinkP300.cpp',
             'vitoconnect_optolinkKW.cpp', 'vitoconnect_optolinkGWG.cpp', 'number/vitoconnect_number.cpp')]
-        cmd = ['g++', '-std=c++17', '-O0', '-g', '-I', str(build), '-I', str(component),
+        cmd = ['g++', '-std=c++17', '-O0', '-g', '-UNDEBUG', '-I', str(build), '-I', str(component),
                str(main), *map(str, sources), '-o', str(build / 'checks')]
-        subprocess.run(cmd, check=True, timeout=60)
+        subprocess.run(cmd, check=True, timeout=60, env={**os.environ, "LC_ALL": "C"})
         return subprocess.run([str(build / 'checks')], check=True, text=True, capture_output=True, timeout=20).stdout
 
 
