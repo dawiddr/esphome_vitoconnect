@@ -74,6 +74,18 @@ of four component pointer aliases in public temporary source copies. It requires
 the intended pointer-access compile error under GCC or Clang, then runs the
 corrected suite. Missing compilers and unrelated compile errors cannot pass.
 
+For the site burner-based gas estimate, also run:
+
+```sh
+g++ -std=c++17 -Wall -Wextra -Werror tests/gas_estimator_checks.cpp -o /tmp/vito-gas-checks
+/tmp/vito-gas-checks
+```
+
+These checks execute [gas_estimator.h](../gas_estimator.h) with synthetic inputs.
+They cover accumulated volume, calibration changes, burner-off periods, stale
+and invalid inputs, restart gaps, and clock rollover. They do not establish
+the accuracy of the burner power value or its relation to measured gas flow.
+
 These checks do not run ESPHome schema validation, its code generator, its real
 scheduler, or a target toolchain. A passing host suite does not establish
 physical boiler compatibility. Report failed, skipped required, empty, or

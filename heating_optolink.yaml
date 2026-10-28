@@ -29,6 +29,8 @@ esphome:
   friendly_name: ${friendly_name}
   min_version: 2026.8.0
   build_path: esp32
+  includes:
+    - gas_estimator.h
   platformio_options:
     upload_speed: 115200
 
@@ -113,6 +115,16 @@ vitoconnect:
 # Globals used by the fail-safe optimizer layer
 # -----------------------------------------------------------------------------
 globals:
+  # Independent persisted counters: changing calibration never rescales history.
+  - id: gas_equivalent_hours
+    type: double
+    restore_value: yes
+    initial_value: "0.0"
+  - id: gas_estimated_volume
+    type: double
+    restore_value: yes
+    initial_value: "0.0"
+
   # No trusted fallback exists in this state. Only explicit operator capture
   # may commission it; ordinary restore requests never trust current outputs.
   - id: commissioning_required
@@ -446,6 +458,21 @@ switch:
       - script.execute: revert_to_baseline
 
 number:
+  # Local estimate setting only; 0 leaves gas output unavailable until calibrated.
+  - platform: template
+    name: "Gas flow at full burner power"
+    id: gas_full_power_flow
+    entity_category: config
+    icon: mdi:gas-burner
+    unit_of_measurement: "m³/h"
+    mode: box
+    min_value: 0
+    max_value: 10
+    step: 0.001
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+
   # Bounded setpoint-control surface. The ESP writes this target to both
   # Viessmann normal and reduced heating setpoints.
   - platform: template
@@ -777,12 +804,59 @@ sensor:
   - platform: vitoconnect
     vitoconnect_id: vito
     name: "Burner power"
+    id: burner_power
     address: 0xA38F
     length: 1
     unit_of_measurement: "%"
     state_class: measurement
     accuracy_decimals: 1
     filters: [ { multiply: 0.5 } ]
+    on_value:
+      then:
+        - lambda: |-
+            vitoconnect_site::gas_estimator.set_power(x, millis());
+
+  # Numeric input callbacks run on every successful read, even for an unchanged
+  # status. Publish the existing binary entity from this single Optolink read.
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    id: burner_activity_raw
+    internal: true
+    address: 0x55D3
+    length: 1
+    on_value:
+      then:
+        - lambda: |-
+            vitoconnect_site::gas_estimator.set_activity(x, millis());
+            id(burner_active).publish_state(x != 0.0f);
+
+  - platform: template
+    name: "Burner full-load equivalent runtime"
+    id: gas_equivalent_runtime
+    entity_category: diagnostic
+    icon: mdi:timer-outline
+    unit_of_measurement: "h"
+    state_class: total_increasing
+    accuracy_decimals: 6
+    update_interval: never
+
+  - platform: template
+    name: "Estimated gas flow"
+    id: gas_estimated_flow
+    icon: mdi:gas-burner
+    unit_of_measurement: "m³/h"
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+
+  - platform: template
+    name: "Estimated gas consumption"
+    id: gas_estimated_consumption
+    unit_of_measurement: "m³"
+    device_class: gas
+    state_class: total_increasing
+    accuracy_decimals: 4
+    update_interval: never
 
   - platform: vitoconnect
     vitoconnect_id: vito
@@ -861,6 +935,16 @@ sensor:
 
 binary_sensor:
   - platform: template
+    name: "Gas estimate inputs valid"
+    id: gas_estimate_inputs_valid
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Gas estimate calibration set"
+    id: gas_estimate_calibration_set
+    entity_category: diagnostic
+
+  - platform: template
     name: "Optimizer commissioning required"
     entity_category: diagnostic
     device_class: problem
@@ -883,10 +967,9 @@ binary_sensor:
     address: 0x2906
     device_class: running
 
-  - platform: vitoconnect
-    vitoconnect_id: vito
+  - platform: template
     name: "Burner active"
-    address: 0x55D3
+    id: burner_active
     device_class: running
 
   - platform: vitoconnect
@@ -960,6 +1043,20 @@ text_sensor:
 # Watchdog + baseline capture / boot enforcement
 # -----------------------------------------------------------------------------
 interval:
+  # Read-only burner estimate. Do not integrate through stale data or restart gaps.
+  - interval: 5s
+    then:
+      - lambda: |-
+          auto &estimate = vitoconnect_site::gas_estimator;
+          const float calibration = id(gas_full_power_flow).state;
+          estimate.tick(millis(), calibration, id(gas_equivalent_hours), id(gas_estimated_volume));
+          const bool calibrated = estimate.calibration_set(calibration);
+          id(gas_equivalent_runtime).publish_state(id(gas_equivalent_hours));
+          id(gas_estimated_flow).publish_state(estimate.flow());
+          id(gas_estimated_consumption).publish_state(calibrated ? id(gas_estimated_volume) : NAN);
+          id(gas_estimate_inputs_valid).publish_state(estimate.inputs_valid());
+          id(gas_estimate_calibration_set).publish_state(calibrated);
+
   # Baseline capture is deliberately operator-only. Healthy reads or HA startup
   # cannot silently adopt possibly optimized values as a trusted fallback.
 

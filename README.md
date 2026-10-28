@@ -97,6 +97,60 @@ Report the exact tested versions, board, and firmware framework with each
 validation result. See the [test guide](tests/README.md) for the review procedure
 and the limits of host tests, firmware builds, and physical checks.
 
+## Estimated gas usage in the site configuration
+
+`heating_optolink.yaml` provides a burner-based estimate. Keep `gas_estimator.h`
+beside the YAML when building or copying this configuration. The estimate reads
+the existing burner power and active status; it does not write boiler settings.
+
+Home Assistant receives these entities:
+
+| Entity | Purpose |
+| --- | --- |
+| Burner full-load equivalent runtime | Calibration counter in hours. One hour at 50% power adds 0.5 hours while the burner is active. |
+| Gas flow at full burner power | Calibration setting in m³/h. Its initial value of 0 means calibration is not set. |
+| Estimated gas flow | Current estimated flow in m³/h. |
+| Estimated gas consumption | Accumulated estimated volume in m³, suitable for the Energy dashboard. |
+| Gas estimate inputs valid | Indicates that both burner readings are recent and within the accepted range. |
+| Gas estimate calibration set | Indicates that a positive calibration value has been entered. |
+
+### Calibrate with two gas meter readings
+
+1. Record the gas meter total **M1** in m³ and the full-load equivalent runtime
+   **H1** in hours at the same time.
+2. Let the boiler operate normally over a useful period, preferably a day or more.
+   Other gas appliances must not consume gas during the calibration period,
+   unless their consumption can be subtracted from the meter change.
+3. Record the new meter total **M2** and equivalent runtime **H2** together.
+4. Calculate **(M2 − M1) / (H2 − H1)**. Both differences must be positive.
+5. Enter the result in **Gas flow at full burner power** in Home Assistant.
+
+For example, a meter change of 3 m³ and an equivalent runtime change of 1.5 hours
+give a calibration value of **2.000 m³/h**. This is an example, not a value for
+your boiler. Gas flow and consumption remain unavailable until calibration is
+set; the equivalent runtime counter runs before calibration. Gas consumption
+starts accumulating after calibration and does not include the calibration
+period. Changing calibration affects future increments only.
+
+The estimate assumes that gas flow is proportional to reported burner power.
+It covers both heating and hot water. Check it against later meter readings,
+especially when the burner operates at different power levels. The 60-second
+Optolink polling interval limits accuracy during short firing cycles.
+
+The calculation runs every five seconds. It pauses when either reading is more
+than 90 seconds old, when a value is invalid, or across a restart or a scheduler
+gap longer than ten seconds. It does not fill missing periods after recovery.
+Adjust the freshness limit in `gas_estimator.h` if the boiler polling interval
+changes. Both counters and the calibration setting are restored after restart;
+a sudden power loss can lose recent unsaved increments.
+
+Check the calculation with:
+
+```sh
+g++ -std=c++17 -Wall -Wextra -Werror tests/gas_estimator_checks.cpp -o /tmp/vito-gas-checks
+/tmp/vito-gas-checks
+```
+
 ## Credits
 
 Built based on [VitoWifi] by [Bert Melis] and inspired by [vitowifi_esphome] by [Philipp Hack].
