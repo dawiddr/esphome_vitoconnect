@@ -74,6 +74,13 @@ of four component pointer aliases in public temporary source copies. It requires
 the intended pointer-access compile error under GCC or Clang, then runs the
 corrected suite. Missing compilers and unrelated compile errors cannot pass.
 
+The host suite also uses the site's heating curve and DHW number definitions
+with production number encoding and hub callbacks. It checks one-byte writes,
+slope scaling, negative curve levels, command limits, startup without writes,
+and state publication after verified readback. It rejects duplicate datapoints
+for these three addresses. The fake boiler does not verify the installed
+controller's address map or physical response.
+
 For the site burner-based gas estimate, also run:
 
 ```sh

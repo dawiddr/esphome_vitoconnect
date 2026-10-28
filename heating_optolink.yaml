@@ -513,7 +513,57 @@ number:
           id(heating_setpoint_target_optimizer).publish_state(accepted);
       - script.execute: apply_heating_setpoint
 
-  # --- Direct boiler writeables (disabled by default; use with care) ---------
+  # Manual HO1B settings. Each number publishes actual Optolink readback;
+  # no initial value or restored command is written at boot. See docs/ACTUATOR.md.
+  # A1/M1 curve addresses differ from the 0x2304/0x2305 used by older controls.
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    id: heating_curve_slope
+    name: "Heating curve slope"
+    entity_category: config
+    icon: mdi:chart-line
+    mode: box
+    address: 0x27D3
+    length: 1
+    signed: false
+    div_ratio: 10
+    min_value: 0.2
+    max_value: 3.5
+    step: 0.1
+
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    id: heating_curve_level
+    name: "Heating curve level"
+    entity_category: config
+    icon: mdi:chart-line
+    unit_of_measurement: "K"
+    mode: box
+    address: 0x27D4
+    length: 1
+    signed: true
+    min_value: -13
+    max_value: 40
+    step: 1
+
+  # Replace the read-only sensor at 0x6300; register this address only once.
+  - platform: vitoconnect
+    vitoconnect_id: vito
+    id: dhw_setpoint
+    name: "DHW setpoint"
+    entity_category: config
+    icon: mdi:water-thermometer
+    unit_of_measurement: "°C"
+    device_class: temperature
+    mode: box
+    address: 0x6300
+    length: 1
+    signed: false
+    min_value: 10
+    max_value: 60
+    step: 1
+
+  # --- Internal boiler setpoints owned by the optimizer ---------------------
   
   # Setpoint-control mode writes both normal and reduced. HA should write only
   # "Heating setpoint target (optimizer)" during normal operation.
@@ -704,16 +754,6 @@ sensor:
     state_class: measurement
     accuracy_decimals: 1
     filters: [ { multiply: 0.1 } ]
-
-  - platform: vitoconnect
-    vitoconnect_id: vito
-    name: "DHW setpoint"
-    address: 0x6300
-    length: 1
-    unit_of_measurement: "°C"
-    device_class: temperature
-    state_class: measurement
-    accuracy_decimals: 0
 
   - platform: vitoconnect
     vitoconnect_id: vito

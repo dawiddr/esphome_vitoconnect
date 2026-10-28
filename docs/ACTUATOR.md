@@ -26,6 +26,58 @@ operator commissioning. Do not infer a replacement baseline from a potentially
 optimized cached pair. Preserve bounded retries, heartbeat eligibility, read
 freshness, pair coherence, and command/read identities when changing either side.
 
+## Manual heating curve and DHW controls
+
+The site configuration provides three number entities for the configured
+Vitotronic 200 HO1B controller. The heating curve controls apply to circuit
+A1/M1 (HK1).
+
+| Entity | Address | Wire format | Control range | Step |
+| --- | --- | --- | --- | --- |
+| Heating curve slope | `0x27D3` | 1 unsigned byte; raw value divided by 10 | 0.2 to 3.5 | 0.1 |
+| Heating curve level | `0x27D4` | 1 signed byte; temperature difference in K | −13 to +40 K | 1 K |
+| DHW setpoint | `0x6300` | 1 unsigned byte; whole °C | 10 to 60 °C | 1 °C |
+
+The address and byte definitions come from the OpenV
+[P300 command map](https://github.com/openv/vcontrold/blob/8ca47972c9ac5b0a14a7a36393b0dbfdb165f918/xml/300/vito.xml)
+and its
+[unit conversions](https://github.com/openv/vcontrold/blob/8ca47972c9ac5b0a14a7a36393b0dbfdb165f918/xml/300/vcontrold.xml),
+checked on 2026-10-28. That map identifies device `20CB` as `VScotHO1` and uses
+`0x27D3`/`0x27D4` for its curve reads and writes. The older
+`0x2305`/`0x2304` defaults are not used in this site configuration.
+
+The curve ranges match the HO1B specification in the Viessmann
+[Vitodens technical guide, page 81](https://viessmanndirect.co.uk/AttachedFileProxy.aspx?file_Id=e534bbfe-ebbd-4fd5-9356-a39001291823).
+The DHW control is limited to 60 °C. Viessmann documents a default 10–60 °C
+range with coding `56:0` in the
+[HO1B/300-K service guide, page 89](https://www.viessmann.ca/content/dam/public-brands/ca/pdfs/doc/b2ha_ctrl/vitotronic_300k-mw2c_is.pdf/_jcr_content/renditions/original./vitotronic_300k-mw2c_is.pdf).
+Some boiler variants allow a higher maximum. These controls do not change that
+coding or establish the permitted range for another boiler variant.
+
+Each number reads the actual boiler setting. It does not write an initial or
+restored value at startup. A command queues a write for the next Optolink poll;
+the site polls every 60 seconds. The displayed value changes only after a wire
+read. With the site's `verify_writes: true`, a write acknowledgement alone does
+not publish the requested value. Readback requires a later poll, and each
+command has the existing three-failure retry limit. Check the returned value
+after a command; a failed command can leave the previous value displayed.
+
+These are manual boiler settings. The optimizer owns the normal and reduced
+room setpoints. Its baseline restore does not restore the curve or DHW setting.
+Disable optimization, disarm control, and complete any required baseline restore
+before tuning the curve. Record the current settings first. During authorized
+physical acceptance, compare all three reads with the boiler display, then
+check one deliberate change and its returned value. Offline tests do not
+confirm the address mapping or write behavior on the installed boiler.
+
+The **DHW setpoint** number replaces the sensor of the same name. Each address
+has one Optolink datapoint. Home Assistant uses separate `sensor` and `number`
+domains, so update dashboards and automations that refer to the old DHW sensor
+to use the new number entity. The old entity can remain unavailable in the
+Home Assistant entity registry until it is removed there. Heating setpoint
+readbacks and optimizer status entities remain available for the control
+contract. Actual tank, outlet, and flow temperatures remain sensors.
+
 ## Commissioning and upgrades
 
 These are attended installation procedures. Flashing, deployment, pairing, and

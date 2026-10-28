@@ -67,6 +67,7 @@ def run_checks(root: Path) -> str:
 #include <functional>
 #include <string>
 #include <vector>
+#include <map>
 #include <iostream>
 #define private public
 #define protected public
@@ -109,6 +110,34 @@ struct RestoreScript { void execute(){restore_script();} } restore_heating_setpo
   if ({optimistic}) heating_setpoint_target_optimizer.publish_state(value);
 }}
 '''
+    # Exercise the site's actual number configuration with production encoding
+    # and hub callbacks. The raw-byte expectations below come from the HO1 map.
+    manual_ids = ('heating_curve_slope', 'heating_curve_level', 'dhw_setpoint')
+    for ident in manual_ids:
+        cpp += f'OPTOLINKNumber {ident};\n'
+    cpp += 'void setup_manual_numbers() {\n'
+    for ident in manual_ids:
+        setting = item('number', ident)
+        signed = setting.get('signed', float(setting['min_value']) < 0)
+        cpp += f'''
+  {ident} = OPTOLINKNumber{{}};
+  {ident}.setAddress({setting['address']});
+  {ident}.setLength({setting['length']});
+  {ident}.setDivRatio({setting.get('div_ratio', 1)});
+  {ident}.setSigned({str(signed).lower()});
+  {ident}.traits.min = {setting['min_value']};
+  {ident}.traits.max = {setting['max_value']};
+  {ident}.traits.step = {setting['step']};
+'''
+    cpp += '}\n'
+    # A number replaces the DHW sensor. Duplicate address registrations can
+    # publish conflicting state and add redundant reads to the shared queue.
+    for address in (0x27D3, 0x27D4, 0x6300):
+        registrations = [entity for entities in config.values() if isinstance(entities, list)
+                         for entity in entities if isinstance(entity, dict)
+                         and entity.get('platform') == 'vitoconnect'
+                         and entity.get('address') == address]
+        assert len(registrations) == 1, f'Duplicate or missing datapoint: {address:#06x}'
     cpp += r'''
 void reset(float actual=22) {
   fake_millis=1000;
@@ -132,13 +161,16 @@ class FakeOptolink : public Optolink {
   FakeOptolink(uart::UARTDevice* u):Optolink(u){}
   void begin() override{} void loop() override{}
   int writes=0, reads=0; uint8_t boiler_normal=23, boiler_reduced=23;
+  std::map<uint16_t, uint8_t> boiler_manual{{0x27D3, 14}, {0x27D4, 0xF3}, {0x6300, 50}};
   void drain(bool fail) {
     while (auto* front=_queue.front()) {
       auto req=*front;
       if(req.write) ++writes; else ++reads;
       if(fail) _onError(TIMEOUT,req.arg);
       else {
-        uint8_t& value=req.address==0x2306 ? boiler_normal:boiler_reduced;
+        assert(req.length == 1);
+        uint8_t& value=req.address==0x2306 ? boiler_normal:
+                       req.address==0x2307 ? boiler_reduced:boiler_manual.at(req.address);
         if(req.write) value=req.data[0];
         _onData(&value,1,req.arg);
       }
@@ -164,6 +196,65 @@ void poll(VitoConnect& hub, FakeOptolink& transport, bool fail) {
   hub.update(); transport.drain(fail); tick();
 }
 int main() {
+  setup_manual_numbers();
+  {
+    struct Boundary { OPTOLINKNumber* number; float min, max; uint8_t min_raw, max_raw; };
+    const Boundary boundaries[] = {
+      {&heating_curve_slope, 0.2f, 3.5f, 2, 35},
+      {&heating_curve_level, -13, 40, 0xF3, 40},
+      {&dhw_setpoint, 10, 60, 10, 60},
+    };
+    for (const auto& b : boundaries) {
+      assert(b.number->getLength()==1 && !b.number->hasPendingCommand());
+      b.number->control(b.min-100);
+      uint8_t raw[2] = {0, 0xA5};
+      b.number->encode(raw, 2);
+      assert(std::fabs(b.number->getPendingCommandValue()-b.min)<0.0001f);
+      assert(raw[0]==b.min_raw && raw[1]==0xA5);
+      b.number->control(b.max+100);
+      b.number->encode(raw, 2);
+      assert(std::fabs(b.number->getPendingCommandValue()-b.max)<0.0001f);
+      assert(raw[0]==b.max_raw && raw[1]==0xA5);
+      auto sequence=b.number->getLastUpdate();
+      b.number->control(NAN); b.number->control(INFINITY);
+      assert(b.number->getLastUpdate()==sequence);
+      assert(!b.number->has_state()); // A command alone is never actual state.
+    }
+    heating_curve_slope.control(1.44f);
+    heating_curve_level.control(-4.6f);
+    dhw_setpoint.control(54.6f);
+    assert(std::fabs(heating_curve_slope.getPendingCommandValue()-1.4f)<0.0001f);
+    assert(heating_curve_level.getPendingCommandValue()==-5);
+    assert(dhw_setpoint.getPendingCommandValue()==55);
+    std::cout << "PASS: manual curve and DHW limits, signed bytes, scaling and command quantization\n";
+  }
+  reset(); setup_manual_numbers();
+  {
+    VitoConnect hub; auto* transport=connect(hub);
+    hub.register_datapoint(&heating_curve_slope);
+    hub.register_datapoint(&heating_curve_level);
+    hub.register_datapoint(&dhw_setpoint);
+    hub.update(); transport->drain(false);
+    assert(transport->writes==0); // Registration and startup only read settings.
+    assert(std::fabs(heating_curve_slope.state-1.4f)<0.0001f);
+    assert(heating_curve_level.state==-13 && dhw_setpoint.state==50);
+    heating_curve_slope.control(1.5f);
+    heating_curve_level.control(-5);
+    dhw_setpoint.control(55);
+    hub.update(); transport->drain(false);
+    assert(transport->writes==3);
+    assert(transport->boiler_manual.at(0x27D3)==15);
+    assert(transport->boiler_manual.at(0x27D4)==0xFB);
+    assert(transport->boiler_manual.at(0x6300)==55);
+    assert(heating_curve_slope.isVerifyPending() && heating_curve_level.isVerifyPending() && dhw_setpoint.isVerifyPending());
+    assert(std::fabs(heating_curve_slope.state-1.4f)<0.0001f);
+    assert(heating_curve_level.state==-13 && dhw_setpoint.state==50);
+    hub.update(); transport->drain(false);
+    assert(std::fabs(heating_curve_slope.state-1.5f)<0.0001f);
+    assert(heating_curve_level.state==-5 && dhw_setpoint.state==55);
+    assert(!heating_curve_slope.hasPendingCommand() && !heating_curve_level.hasPendingCommand() && !dhw_setpoint.hasPendingCommand());
+    std::cout << "PASS: manual settings read at startup and publish only after verified wire readback\n";
+  }
   reset(); setpoint_control_armed=true; last_restore_attempt_ms=500;
   heating_setpoint_normal_direct.control(23); heating_setpoint_reduced_direct.control(23);
   revert_script();

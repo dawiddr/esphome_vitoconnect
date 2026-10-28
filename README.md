@@ -97,6 +97,14 @@ Report the exact tested versions, board, and firmware framework with each
 validation result. See the [test guide](tests/README.md) for the review procedure
 and the limits of host tests, firmware builds, and physical checks.
 
+## Heating curve and DHW controls in the site configuration
+
+`heating_optolink.yaml` provides number controls for **Heating curve slope**,
+**Heating curve level**, and **DHW setpoint**. The DHW number replaces its
+read-only sensor. See the [actuator guide](docs/ACTUATOR.md#manual-heating-curve-and-dhw-controls)
+for the HO1B addresses, ranges, readback behavior, and Home Assistant entity
+migration.
+
 ## Estimated gas usage in the site configuration
 
 `heating_optolink.yaml` provides a burner-based estimate. Keep `gas_estimator.h`
